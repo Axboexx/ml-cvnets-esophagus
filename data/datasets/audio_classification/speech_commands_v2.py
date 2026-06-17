@@ -10,14 +10,34 @@ import random
 from typing import Dict, Tuple, Union
 
 import torch
-import torchaudio
 from torch import Tensor
 from torch.nn import functional as F
 
 from data.datasets import DATASET_REGISTRY, dataset_base
-from data.transforms.audio import Noise, Roll, SetFixedLength
 from data.transforms.common import Compose
 from data.transforms.image_pil import BaseTransformation
+from utils.import_utils import import_optional_module
+
+torchaudio, _torchaudio_import_error = import_optional_module("torchaudio")
+
+
+def _require_torchaudio() -> None:
+    if torchaudio is None:
+        raise ImportError(
+            "torchaudio is required for SpeechCommandsV2Dataset, but it could not be imported."
+        ) from _torchaudio_import_error
+
+
+def _get_audio_transforms() -> Tuple[object, object, object]:
+    try:
+        from data.transforms.audio import Noise, Roll, SetFixedLength
+
+        return Noise, Roll, SetFixedLength
+    except (ImportError, OSError) as exc:
+        raise ImportError(
+            "Audio transforms are required for SpeechCommandsV2Dataset, "
+            "but they could not be imported."
+        ) from exc
 
 
 @DATASET_REGISTRY.register(name="speech_commands_v2", type="audio_classification")
@@ -80,6 +100,7 @@ class SpeechCommandsv2Dataset(dataset_base.BaseDataset):
 
         if getattr(self.opts, "audio_augmentation.noise.enable"):
             # Cache this, since it loads files on initialization.
+            Noise, _, _ = _get_audio_transforms()
             background_dir = os.path.join(self.root, "_background_noise_")
             self.noise = Noise(self.opts, noise_files_dir=background_dir)
 
@@ -97,6 +118,7 @@ class SpeechCommandsv2Dataset(dataset_base.BaseDataset):
         """
         Returns transformations applied to the input in training mode.
         """
+        _, Roll, SetFixedLength = _get_audio_transforms()
         aug_list = [
             SetFixedLength(self.opts),
         ]
@@ -111,6 +133,7 @@ class SpeechCommandsv2Dataset(dataset_base.BaseDataset):
         """
         Returns transformations applied to the input in validation mode.
         """
+        _, _, SetFixedLength = _get_audio_transforms()
         aug_list = [SetFixedLength(self.opts)]
         return Compose(self.opts, aug_list)
 
@@ -118,6 +141,7 @@ class SpeechCommandsv2Dataset(dataset_base.BaseDataset):
         """
         Get the dataset sample at the given index.
         """
+        _require_torchaudio()
         dataset_entry = self.dataset_entries[index]
         waveform, audio_fps = torchaudio.load(dataset_entry["audio_filepath"])
 

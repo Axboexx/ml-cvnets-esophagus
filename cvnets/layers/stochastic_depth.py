@@ -4,15 +4,37 @@
 #
 
 from torch import Tensor
-from torchvision.ops import StochasticDepth as StochasticDepthTorch
+from torch import rand
+
+from cvnets.layers.base_layer import BaseLayer
 
 
-class StochasticDepth(StochasticDepthTorch):
+class StochasticDepth(BaseLayer):
     """
-    Implements the Stochastic Depth `"Deep Networks with Stochastic Depth"
-    <https://arxiv.org/abs/1603.09382>`_ used for randomly dropping residual
-    branches of residual architectures.
+    Drop residual branches during training without depending on torchvision.
     """
 
     def __init__(self, p: float, mode: str) -> None:
-        super().__init__(p=p, mode=mode)
+        super().__init__()
+        if not 0.0 <= p <= 1.0:
+            raise ValueError(f"Drop probability has to be in [0, 1], got {p}")
+        if mode not in {"batch", "row"}:
+            raise ValueError(f"Mode has to be 'batch' or 'row', got {mode}")
+        self.p = p
+        self.mode = mode
+
+    def forward(self, x: Tensor) -> Tensor:
+        if not self.training or self.p == 0.0:
+            return x
+        survival_rate = 1.0 - self.p
+        if survival_rate == 0.0:
+            return x.mul(0.0)
+
+        if self.mode == "batch":
+            mask_shape = [1] * x.ndim
+        else:
+            mask_shape = [x.shape[0]] + [1] * (x.ndim - 1)
+
+        noise = rand(mask_shape, dtype=x.dtype, device=x.device)
+        binary_mask = (noise < survival_rate).to(dtype=x.dtype)
+        return x * binary_mask / survival_rate

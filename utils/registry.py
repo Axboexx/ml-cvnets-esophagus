@@ -156,6 +156,16 @@ class Registry:
 
         def register_with_name(item: RegistryItem) -> RegistryItem:
             if name in self.registry:
+                existing_item = self.registry[name]
+                if self.registry_name == "transformation":
+                    return existing_item
+                if (
+                    getattr(existing_item, "__module__", None)
+                    == getattr(item, "__module__", None)
+                    and getattr(existing_item, "__name__", None)
+                    == getattr(item, "__name__", None)
+                ):
+                    return existing_item
                 raise ValueError(
                     "Cannot register duplicate {} ({})".format(self.registry_name, name)
                 )

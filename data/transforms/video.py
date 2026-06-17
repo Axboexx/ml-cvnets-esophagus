@@ -14,15 +14,34 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import psutil
 import torch
-import torchaudio
 from torch.nn import functional as F
-from torchvision.io import write_video
 from torchvision.transforms import functional as FV
 
 from data.transforms import TRANSFORMATIONS_REGISTRY, BaseTransformation
 from data.transforms.utils import *
 from options.parse_args import JsonValidator
 from utils import logger
+from utils.import_utils import import_optional_module
+
+torchaudio, _torchaudio_import_error = import_optional_module("torchaudio")
+torchvision_io, _torchvision_io_import_error = import_optional_module("torchvision.io")
+
+
+def _require_torchaudio() -> None:
+    if torchaudio is None:
+        raise ImportError(
+            "torchaudio is required for video transforms that process audio, but it could not be imported."
+        ) from _torchaudio_import_error
+
+
+def _write_video(*args, **kwargs) -> None:
+    if torchvision_io is None or not hasattr(torchvision_io, "write_video"):
+        raise ImportError(
+            "torchvision.io.write_video is required for video SaveInputs, but it "
+            "could not be imported from the installed torchvision package."
+        ) from _torchvision_io_import_error
+    torchvision_io.write_video(*args, **kwargs)
+
 
 SUPPORTED_PYTORCH_INTERPOLATIONS = ["nearest", "bilinear", "bicubic"]
 
@@ -335,10 +354,11 @@ class SaveInputs(BaseTransformation):
         if audio is not None or self.get_frame_captions is not None:
             with tempfile.TemporaryDirectory() as tmp_dir:
                 tmp_video = Path(tmp_dir, "video" + suffix)
-                write_video(str(tmp_video), video_array=video, fps=video_fps)
+                _write_video(str(tmp_video), video_array=video, fps=video_fps)
                 command = ["ffmpeg", "-i", tmp_video]
 
                 if audio is not None:
+                    _require_torchaudio()
                     tmp_audio = str(Path(tmp_dir, "audio.wav"))
                     torchaudio.save(tmp_audio, audio.transpose(0, 1), audio_fps)
                     command.extend(["-i", tmp_audio])
@@ -370,7 +390,7 @@ class SaveInputs(BaseTransformation):
                     stderr=subprocess.PIPE,
                 )
         else:
-            write_video(str(output_video_path), video_array=video, fps=video_fps)
+            _write_video(str(output_video_path), video_array=video, fps=video_fps)
 
 
 @TRANSFORMATIONS_REGISTRY.register(name="random_resized_crop", type="video")

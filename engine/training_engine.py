@@ -4,12 +4,16 @@
 #
 
 import copy
+import csv
 import gc
+import json
+import math
 import shutil
 import time
 import traceback
 from itertools import product
-from typing import Dict, Union
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
 
 import numpy as np
 import torch
@@ -30,7 +34,7 @@ from utils.checkpoint_utils import (
 )
 from utils.common_utils import move_to_device, unwrap_model_fn
 from utils.ddp_utils import dist_barrier, is_master
-from utils.tensor_utils import reduce_tensor_sum
+from utils.tensor_utils import all_gather_list, reduce_tensor_sum
 
 
 class Trainer(object):
@@ -114,6 +118,77 @@ class Trainer(object):
         )
 
         self.save_location = getattr(opts, "common.exp_loc", "results/run_1")
+        self.metrics_jsonl_path = Path(self.save_location) / "training_metrics.jsonl"
+        self.metrics_csv_path = Path(self.save_location) / "training_metrics.csv"
+        self.run_summary_path = Path(self.save_location) / "training_run_summary.json"
+        self.confusion_jsonl_path = (
+            Path(self.save_location) / "validation_confusion_matrix.jsonl"
+        )
+        self.confusion_csv_path = (
+            Path(self.save_location) / "validation_confusion_matrix.csv"
+        )
+        self.misclassified_jsonl_path = (
+            Path(self.save_location) / "validation_misclassified_samples.jsonl"
+        )
+        self.misclassified_csv_path = (
+            Path(self.save_location) / "validation_misclassified_samples.csv"
+        )
+        self.metrics_csv_fields = [
+            "epoch",
+            "iteration",
+            "train_loss",
+            "val_loss",
+            "ckpt_metric_name",
+            "ckpt_submetric_name",
+            "train_ckpt_metric",
+            "val_ckpt_metric",
+            "best_metric",
+            "is_best",
+            "is_ema_best",
+            "lr",
+            "elapsed_seconds",
+            "val_ema_loss",
+            "val_ema_ckpt_metric",
+            "val_tn",
+            "val_fp",
+            "val_fn",
+            "val_tp",
+            "val_accuracy",
+            "val_precision",
+            "val_sensitivity",
+            "val_recall",
+            "val_specificity",
+            "val_f1",
+            "val_f1_score",
+            "val_auc",
+            "best_metric_source",
+        ]
+        self.confusion_csv_fields = [
+            "epoch",
+            "stage",
+            "threshold",
+            "tn",
+            "fp",
+            "fn",
+            "tp",
+            "accuracy",
+            "precision",
+            "sensitivity",
+            "recall",
+            "specificity",
+            "f1",
+            "f1_score",
+            "auc",
+        ]
+        self.misclassified_csv_fields = [
+            "epoch",
+            "stage",
+            "sample_index",
+            "case_id",
+            "target",
+            "prediction",
+            "score",
+        ]
 
         self.log_writers = get_log_writers(self.opts, save_location=self.save_location)
 
@@ -164,6 +239,301 @@ class Trainer(object):
         # save interval checkpoints every `save_interval_freq` updates on the master node
         self.save_interval = self.is_master_node and save_interval_freq > 0
         self.save_interval_freq = save_interval_freq
+
+    @staticmethod
+    def _json_safe(value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return value.detach().cpu().item()
+            return value.detach().cpu().tolist()
+        if isinstance(value, dict):
+            return {str(k): Trainer._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [Trainer._json_safe(v) for v in value]
+        return str(value)
+
+    def _append_epoch_metrics(self, metrics: Dict) -> None:
+        if not self.is_master_node:
+            return
+
+        self.metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        safe_metrics = self._json_safe(metrics)
+        with self.metrics_jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(safe_metrics, ensure_ascii=False, sort_keys=True) + "\n")
+
+        write_header = not self.metrics_csv_path.exists()
+        row = {field: safe_metrics.get(field) for field in self.metrics_csv_fields}
+        if isinstance(row.get("lr"), list):
+            row["lr"] = json.dumps(row["lr"], ensure_ascii=False)
+        with self.metrics_csv_path.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.metrics_csv_fields)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+    @staticmethod
+    def _safe_divide(numerator: float, denominator: float) -> float:
+        if denominator <= 0:
+            return 0.0
+        return numerator / denominator
+
+    @staticmethod
+    def _binary_probabilities_from_logits(
+        prediction: Tensor, target: Tensor
+    ) -> Optional[Dict[str, Tensor]]:
+        if target.ndim != 1 or prediction.ndim != 2:
+            return None
+        if prediction.shape[0] != target.shape[0]:
+            return None
+        if prediction.shape[1] == 2:
+            positive_probability = torch.softmax(prediction.float(), dim=1)[:, 1]
+        elif prediction.shape[1] == 1:
+            positive_probability = torch.sigmoid(prediction.float()[:, 0])
+        else:
+            return None
+
+        target_label = target.long()
+        if not torch.all((target_label == 0) | (target_label == 1)):
+            return None
+
+        return {"labels": target_label, "probabilities": positive_probability}
+
+    @staticmethod
+    def _binary_auc(labels: np.ndarray, probabilities: np.ndarray) -> float:
+        labels = labels.astype(np.int64)
+        probabilities = probabilities.astype(np.float64)
+
+        pos_mask = labels == 1
+        neg_mask = labels == 0
+        pos_count = int(pos_mask.sum())
+        neg_count = int(neg_mask.sum())
+        if pos_count == 0 or neg_count == 0:
+            return 0.5
+
+        order = np.argsort(probabilities, kind="mergesort")
+        sorted_probs = probabilities[order]
+        ranks = np.empty_like(sorted_probs, dtype=np.float64)
+
+        start = 0
+        while start < len(sorted_probs):
+            end = start + 1
+            while end < len(sorted_probs) and sorted_probs[end] == sorted_probs[start]:
+                end += 1
+            ranks[start:end] = (start + end - 1) / 2.0 + 1.0
+            start = end
+
+        inv_order = np.empty_like(order)
+        inv_order[order] = np.arange(len(order))
+        original_ranks = ranks[inv_order]
+        rank_sum = float(original_ranks[pos_mask].sum())
+        return (rank_sum - pos_count * (pos_count + 1) / 2.0) / (
+            pos_count * neg_count
+        )
+
+    @classmethod
+    def _binary_confusion_from_logits(
+        cls, prediction: Tensor, target: Tensor
+    ) -> Optional[Tensor]:
+        outputs = cls._binary_probabilities_from_logits(
+            prediction=prediction, target=target
+        )
+        if outputs is None:
+            return None
+
+        pred_label = (outputs["probabilities"] >= 0.5).long()
+        target_label = outputs["labels"]
+        tn = ((pred_label == 0) & (target_label == 0)).sum()
+        fp = ((pred_label == 1) & (target_label == 0)).sum()
+        fn = ((pred_label == 0) & (target_label == 1)).sum()
+        tp = ((pred_label == 1) & (target_label == 1)).sum()
+        return torch.stack([tn, fp, fn, tp]).to(dtype=torch.float64)
+
+    @classmethod
+    def _classification_predictions_from_logits(
+        cls, prediction: Tensor, target: Tensor
+    ) -> Optional[Dict[str, Tensor]]:
+        if target.ndim != 1 or prediction.ndim != 2:
+            return None
+        if prediction.shape[0] != target.shape[0]:
+            return None
+
+        target_label = target.long()
+        if prediction.shape[1] == 1:
+            score = torch.sigmoid(prediction.float()[:, 0])
+            pred_label = (score >= 0.5).long()
+        elif prediction.shape[1] == 2:
+            score = torch.softmax(prediction.float(), dim=1)[:, 1]
+            pred_label = (score >= 0.5).long()
+        else:
+            probabilities = torch.softmax(prediction.float(), dim=1)
+            score, pred_label = torch.max(probabilities, dim=1)
+
+        return {
+            "labels": target_label,
+            "predictions": pred_label,
+            "scores": score,
+        }
+
+    def _case_id_from_sample_index(self, sample_index: int) -> str:
+        dataset = getattr(self.val_loader, "dataset", None)
+        records = getattr(dataset, "records", None)
+        if records is None or sample_index < 0 or sample_index >= len(records):
+            return str(sample_index)
+
+        record = records[sample_index]
+        return str(getattr(record, "case_id", sample_index))
+
+    def _collect_misclassified_samples(
+        self,
+        batch: Dict,
+        prediction: Tensor,
+        target: Tensor,
+        epoch: int,
+        stage: str,
+    ) -> list:
+        outputs = self._classification_predictions_from_logits(
+            prediction=prediction, target=target
+        )
+        if outputs is None or "sample_id" not in batch:
+            return []
+
+        sample_ids = batch["sample_id"].detach().cpu().tolist()
+        labels = outputs["labels"].detach().cpu().tolist()
+        predictions = outputs["predictions"].detach().cpu().tolist()
+        scores = outputs["scores"].detach().cpu().tolist()
+
+        misclassified_samples = []
+        for sample_index, label, predicted_label, score in zip(
+            sample_ids, labels, predictions, scores
+        ):
+            if int(label) == int(predicted_label):
+                continue
+            sample_index = int(sample_index)
+            misclassified_samples.append(
+                {
+                    "epoch": epoch,
+                    "stage": stage,
+                    "sample_index": sample_index,
+                    "case_id": self._case_id_from_sample_index(sample_index),
+                    "target": int(label),
+                    "prediction": int(predicted_label),
+                    "score": float(score),
+                }
+            )
+        return misclassified_samples
+
+    def _summarize_binary_confusion(
+        self,
+        confusion: Optional[Tensor],
+        labels: Optional[list],
+        probabilities: Optional[list],
+        epoch: int,
+        stage: str,
+    ) -> Optional[Dict]:
+        if confusion is None:
+            return None
+
+        if self.use_distributed:
+            confusion = reduce_tensor_sum(confusion)
+            gathered_labels = all_gather_list(labels or [])
+            gathered_probabilities = all_gather_list(probabilities or [])
+            labels = [
+                item for worker_labels in gathered_labels for item in worker_labels
+            ]
+            probabilities = [
+                item
+                for worker_probabilities in gathered_probabilities
+                for item in worker_probabilities
+            ]
+
+        tn, fp, fn, tp = [int(v) for v in confusion.detach().cpu().tolist()]
+        total = tn + fp + fn + tp
+        precision = self._safe_divide(tp, tp + fp)
+        recall = self._safe_divide(tp, tp + fn)
+        specificity = self._safe_divide(tn, tn + fp)
+        f1 = self._safe_divide(2.0 * precision * recall, precision + recall)
+        auc = None
+        if labels and probabilities:
+            auc = self._binary_auc(
+                labels=np.asarray(labels), probabilities=np.asarray(probabilities)
+            )
+
+        return {
+            "epoch": epoch,
+            "stage": stage,
+            "threshold": 0.5,
+            "tn": tn,
+            "fp": fp,
+            "fn": fn,
+            "tp": tp,
+            "accuracy": self._safe_divide(tp + tn, total),
+            "precision": precision,
+            "sensitivity": recall,
+            "recall": recall,
+            "specificity": specificity,
+            "f1": f1,
+            "f1_score": f1,
+            "auc": auc,
+        }
+
+    def _append_confusion_metrics(self, metrics: Optional[Dict]) -> None:
+        if not self.is_master_node or metrics is None:
+            return
+
+        safe_metrics = self._json_safe(metrics)
+        self.confusion_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.confusion_jsonl_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(safe_metrics, ensure_ascii=False, sort_keys=True) + "\n")
+
+        write_header = not self.confusion_csv_path.exists()
+        row = {field: safe_metrics.get(field) for field in self.confusion_csv_fields}
+        with self.confusion_csv_path.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.confusion_csv_fields)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def _append_misclassified_samples(self, samples: list) -> None:
+        if not self.is_master_node or not samples:
+            return
+
+        safe_samples = [self._json_safe(sample) for sample in samples]
+        self.misclassified_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.misclassified_jsonl_path.open("a", encoding="utf-8") as f:
+            for sample in safe_samples:
+                f.write(json.dumps(sample, ensure_ascii=False, sort_keys=True) + "\n")
+
+        write_header = not self.misclassified_csv_path.exists()
+        with self.misclassified_csv_path.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.misclassified_csv_fields)
+            if write_header:
+                writer.writeheader()
+            for sample in safe_samples:
+                row = {
+                    field: sample.get(field)
+                    for field in self.misclassified_csv_fields
+                }
+                writer.writerow(row)
+
+    def _write_run_summary(self, summary: Dict) -> None:
+        if not self.is_master_node:
+            return
+
+        self.run_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.run_summary_path.open("w", encoding="utf-8") as f:
+            json.dump(
+                self._json_safe(summary),
+                f,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
 
     def compute_grad_norm(self):
         parameters = [p for p in self.model.parameters() if p.grad is not None]
@@ -368,7 +738,7 @@ class Trainer(object):
 
     def val_epoch(self, epoch, model, extra_str=""):
         if self.val_loader is None:
-            return 0.0, 0.0
+            return 0.0, 0.0, None
 
         time.sleep(
             if_test_env(0.5, otherwise=2)
@@ -401,6 +771,10 @@ class Trainer(object):
             total_samples = len(self.val_loader)
             processed_samples = 0
             lr = self.scheduler.retrieve_lr(self.optimizer)
+            confusion = None
+            binary_labels = []
+            binary_probabilities = []
+            misclassified_samples = []
             for batch_id, batch in enumerate(self.val_loader):
                 batch = move_to_device(opts=self.opts, x=batch, device=self.device)
 
@@ -414,6 +788,35 @@ class Trainer(object):
                 ):
                     # prediction
                     pred_label = model(samples)
+                    batch_confusion = self._binary_confusion_from_logits(
+                        prediction=pred_label, target=targets
+                    )
+                    if batch_confusion is not None:
+                        if confusion is None:
+                            confusion = torch.zeros_like(batch_confusion)
+                        confusion += batch_confusion
+                    batch_binary_outputs = self._binary_probabilities_from_logits(
+                        prediction=pred_label, target=targets
+                    )
+                    if batch_binary_outputs is not None:
+                        binary_labels.extend(
+                            batch_binary_outputs["labels"].detach().cpu().tolist()
+                        )
+                        binary_probabilities.extend(
+                            batch_binary_outputs["probabilities"]
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        )
+                    misclassified_samples.extend(
+                        self._collect_misclassified_samples(
+                            batch=batch,
+                            prediction=pred_label,
+                            target=targets,
+                            epoch=epoch,
+                            stage="validation" + extra_str,
+                        )
+                    )
                     # compute loss
                     loss_dict_or_tensor = self.criteria(
                         input_sample=samples,
@@ -451,9 +854,26 @@ class Trainer(object):
         if avg_ckpt_metric is None:
             avg_ckpt_metric = avg_loss
 
+        confusion_metrics = self._summarize_binary_confusion(
+            confusion=confusion,
+            labels=binary_labels,
+            probabilities=binary_probabilities,
+            epoch=epoch,
+            stage="validation" + extra_str,
+        )
+        self._append_confusion_metrics(confusion_metrics)
+        if self.use_distributed:
+            gathered_misclassified_samples = all_gather_list(misclassified_samples)
+            misclassified_samples = [
+                sample
+                for worker_samples in gathered_misclassified_samples
+                for sample in worker_samples
+            ]
+        self._append_misclassified_samples(misclassified_samples)
+
         gc.collect()
 
-        return avg_loss, avg_ckpt_metric
+        return avg_loss, avg_ckpt_metric, confusion_metrics
 
     def find_easy_samples(self, epoch, model, *args, **kwargs):
         """
@@ -575,6 +995,10 @@ class Trainer(object):
 
         copy_at_epoch = getattr(self.opts, "ema.copy_at_epoch", -1)
         train_start_time = time.time()
+        last_epoch_metrics = None
+        run_status = "completed"
+        error_trace = None
+        validation_enabled = self.val_loader is not None
 
         cfg_file = getattr(self.opts, "common.config_file", None)
         if cfg_file is not None and self.is_master_node:
@@ -584,6 +1008,30 @@ class Trainer(object):
                 "Configuration file is stored here: {}".format(
                     logger.color_text(dst_cfg_file)
                 )
+            )
+
+        if self.is_master_node:
+            self._write_run_summary(
+                {
+                    "status": "running",
+                    "save_location": self.save_location,
+                    "config_file": cfg_file,
+                    "metrics_jsonl": str(self.metrics_jsonl_path),
+                    "metrics_csv": str(self.metrics_csv_path),
+                    "start_epoch": self.start_epoch,
+                    "start_iteration": self.train_iterations,
+                    "checkpoint_metric": self.ckpt_metric,
+                    "checkpoint_submetric": self.ckpt_submetric,
+                    "checkpoint_metric_max": getattr(
+                        self.opts, "stats.checkpoint_metric_max", False
+                    ),
+                    "train_metric_names": self.train_metric_names,
+                    "val_metric_names": self.val_metric_names,
+                    "validation_enabled": validation_enabled,
+                    "best_metric_source": "validation"
+                    if validation_enabled
+                    else "training",
+                }
             )
 
         keep_k_best_ckpts = getattr(self.opts, "common.k_best_checkpoints", 5)
@@ -605,11 +1053,18 @@ class Trainer(object):
 
                 train_loss, train_ckpt_metric = self.train_epoch(epoch)
 
-                val_loss, val_ckpt_metric = self.val_epoch(
-                    epoch=epoch, model=self.model
-                )
+                if validation_enabled:
+                    val_loss, val_ckpt_metric, val_confusion_metrics = self.val_epoch(
+                        epoch=epoch, model=self.model
+                    )
+                else:
+                    val_loss, val_ckpt_metric, val_confusion_metrics = None, None, None
 
-                if epoch == copy_at_epoch and self.model_ema is not None:
+                if (
+                    validation_enabled
+                    and epoch == copy_at_epoch
+                    and self.model_ema is not None
+                ):
                     if self.is_master_node:
                         logger.log("Copying EMA weights")
                     # copy model_src weights to model_tgt
@@ -621,17 +1076,33 @@ class Trainer(object):
                         logger.log("Running validation after Copying EMA model weights")
                     self.val_epoch(epoch=epoch, model=self.model)
 
-                if max_checkpoint_metric:
-                    is_best = val_ckpt_metric >= self.best_metric
-                    self.best_metric = max(val_ckpt_metric, self.best_metric)
+                checkpoint_metric = (
+                    val_ckpt_metric if validation_enabled else train_ckpt_metric
+                )
+                checkpoint_metric_source = (
+                    "validation" if validation_enabled else "training"
+                )
+                checkpoint_metric_max = max_checkpoint_metric
+                if checkpoint_metric is None:
+                    checkpoint_metric = val_loss if validation_enabled else train_loss
+                    checkpoint_metric_source = (
+                        "validation_loss" if validation_enabled else "training_loss"
+                    )
+                    checkpoint_metric_max = False
+                    if max_checkpoint_metric and self.best_metric == 0.0:
+                        self.best_metric = math.inf
+
+                if checkpoint_metric_max:
+                    is_best = checkpoint_metric >= self.best_metric
+                    self.best_metric = max(checkpoint_metric, self.best_metric)
                 else:
-                    is_best = val_ckpt_metric <= self.best_metric
-                    self.best_metric = min(val_ckpt_metric, self.best_metric)
+                    is_best = checkpoint_metric <= self.best_metric
+                    self.best_metric = min(checkpoint_metric, self.best_metric)
 
                 val_ema_loss = None
                 val_ema_ckpt_metric = None
-                if self.model_ema is not None:
-                    val_ema_loss, val_ema_ckpt_metric = self.val_epoch(
+                if validation_enabled and self.model_ema is not None:
+                    val_ema_loss, val_ema_ckpt_metric, _ = self.val_epoch(
                         epoch=epoch, model=self.model_ema.ema_model, extra_str=" (EMA)"
                     )
                     if max_checkpoint_metric:
@@ -679,6 +1150,46 @@ class Trainer(object):
 
                 if self.is_master_node:
                     lr_list = self.scheduler.retrieve_lr(self.optimizer)
+                    last_epoch_metrics = {
+                        "epoch": epoch,
+                        "iteration": self.train_iterations,
+                        "train_loss": train_loss,
+                        "val_loss": val_loss,
+                        "ckpt_metric_name": self.ckpt_metric,
+                        "ckpt_submetric_name": self.ckpt_submetric,
+                        "train_ckpt_metric": train_ckpt_metric,
+                        "val_ckpt_metric": val_ckpt_metric,
+                        "best_metric": self.best_metric,
+                        "best_metric_source": checkpoint_metric_source,
+                        "is_best": is_best,
+                        "lr": lr_list,
+                        "elapsed_seconds": time.time() - train_start_time,
+                        "val_ema_loss": val_ema_loss,
+                        "val_ema_ckpt_metric": val_ema_ckpt_metric,
+                        "is_ema_best": is_ema_best,
+                    }
+                    if val_confusion_metrics is not None:
+                        last_epoch_metrics.update(
+                            {
+                                "val_tn": val_confusion_metrics["tn"],
+                                "val_fp": val_confusion_metrics["fp"],
+                                "val_fn": val_confusion_metrics["fn"],
+                                "val_tp": val_confusion_metrics["tp"],
+                                "val_accuracy": val_confusion_metrics["accuracy"],
+                                "val_precision": val_confusion_metrics["precision"],
+                                "val_sensitivity": val_confusion_metrics[
+                                    "sensitivity"
+                                ],
+                                "val_recall": val_confusion_metrics["recall"],
+                                "val_specificity": val_confusion_metrics[
+                                    "specificity"
+                                ],
+                                "val_f1": val_confusion_metrics["f1"],
+                                "val_f1_score": val_confusion_metrics["f1_score"],
+                                "val_auc": val_confusion_metrics["auc"],
+                            }
+                        )
+                    self._append_epoch_metrics(last_epoch_metrics)
 
                     for log_writer in self.log_writers:
                         log_metrics(
@@ -703,10 +1214,14 @@ class Trainer(object):
                         logger.info("Max. iterations for training reached")
                     break
         except KeyboardInterrupt as e:
+            run_status = "interrupted"
+            error_trace = traceback.format_exc()
             if self.is_master_node:
                 logger.log("Keyboard interruption. Exiting from early training")
                 raise e
         except Exception as e:
+            run_status = "failed"
+            error_trace = traceback.format_exc()
             if "out of memory" in str(e):
                 logger.log("OOM exception occured")
                 n_gpus = getattr(self.opts, "dev.num_gpus", 1)
@@ -737,6 +1252,29 @@ class Trainer(object):
                 minutes, seconds = divmod(rem, 60)
                 train_time_str = "{:0>2}:{:0>2}:{:05.2f}".format(
                     int(hours), int(minutes), seconds
+                )
+                self._write_run_summary(
+                    {
+                        "status": run_status,
+                        "save_location": self.save_location,
+                        "metrics_jsonl": str(self.metrics_jsonl_path),
+                        "metrics_csv": str(self.metrics_csv_path),
+                        "total_seconds": train_end_time - train_start_time,
+                        "train_time": train_time_str,
+                        "last_epoch_metrics": last_epoch_metrics,
+                        "best_metric": self.best_metric,
+                        "best_metric_source": last_epoch_metrics.get(
+                            "best_metric_source"
+                        )
+                        if last_epoch_metrics is not None
+                        else (
+                            "validation" if validation_enabled else "training"
+                        ),
+                        "validation_enabled": validation_enabled,
+                        "last_iteration": self.train_iterations,
+                        "max_iterations_reached": self.max_iterations_reached,
+                        "error": error_trace,
+                    }
                 )
                 logger.log("Training took {}".format(train_time_str))
 

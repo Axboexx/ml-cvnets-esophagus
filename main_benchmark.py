@@ -3,8 +3,11 @@
 # Copyright (C) 2023 Apple Inc. All Rights Reserved.
 #
 
+import os
 import time
 from typing import Optional
+
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 import torch
 from torch.cuda.amp import autocast

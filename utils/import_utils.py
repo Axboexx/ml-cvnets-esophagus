@@ -5,7 +5,7 @@
 
 import importlib
 import os
-from typing import Sequence
+from typing import Optional, Sequence, Tuple
 
 from common import LIBRARY_ROOT
 from utils import logger
@@ -39,3 +39,18 @@ def import_modules_from_folder(
                     path.relative_to(LIBRARY_ROOT).with_suffix("")
                 ).replace(os.sep, ".")
                 importlib.import_module(module_name)
+
+
+def import_optional_module(module_name: str) -> Tuple[Optional[object], Optional[Exception]]:
+    """Best-effort import helper for optional dependencies.
+
+    Some third-party packages may be installed but fail to load because of missing
+    shared libraries (for example CUDA runtime libraries). In such cases we treat
+    the dependency as unavailable and let callers decide when to raise a task-
+    specific error.
+    """
+
+    try:
+        return importlib.import_module(module_name), None
+    except (ImportError, OSError) as exc:
+        return None, exc

@@ -6,15 +6,8 @@
 import argparse
 from typing import Optional, Tuple
 
-from data.datasets.classification.base_image_classification_dataset import (
-    BaseImageClassificationDataset,
-)
-from data.datasets.classification.base_imagenet_shift_dataset import (
-    BaseImageNetShiftDataset,
-)
 from data.datasets.dataset_base import BaseDataset, BaseImageDataset, BaseVideoDataset
 from data.datasets.detection.base_detection import BaseDetectionDataset
-from data.datasets.multi_modal_img_text import arguments_multi_modal_img_text
 from data.datasets.segmentation.base_segmentation import BaseImageSegmentationDataset
 from utils import logger
 from utils.ddp_utils import is_master
@@ -120,9 +113,14 @@ def get_train_val_datasets(
         valid_dataset = build_dataset_from_registry(
             opts, is_training=False, is_evaluation=False, *args, **kwargs
         )
+        if len(valid_dataset) == 0:
+            valid_dataset = None
+            if is_master_node:
+                logger.warning("Validation dataset is empty. Disabling validation.")
         if is_master_node:
             logger.log("Validation dataset details are given below")
-            print(valid_dataset)
+            if valid_dataset is not None:
+                print(valid_dataset)
 
     return train_dataset, valid_dataset
 
@@ -132,6 +130,14 @@ def arguments_dataset(parser: argparse.ArgumentParser) -> argparse.ArgumentParse
     BaseImageClassificationDataset, BaseImageNetShiftDataset,
     BaseVideoDataset, zero-shot datasets, and DATASET_REGISTRY.
     """
+    from data.datasets.classification.base_image_classification_dataset import (
+        BaseImageClassificationDataset,
+    )
+    from data.datasets.classification.base_imagenet_shift_dataset import (
+        BaseImageNetShiftDataset,
+    )
+    from data.datasets.multi_modal_img_text import arguments_multi_modal_img_text
+
     parser = BaseDataset.add_arguments(parser)
     parser = BaseImageDataset.add_arguments(parser)
     parser = BaseImageSegmentationDataset.add_arguments(parser)

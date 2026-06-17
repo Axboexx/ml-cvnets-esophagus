@@ -5,7 +5,10 @@
 
 import argparse
 import math
+import os
 from typing import List, Optional
+
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 import torch
 from torch.cuda.amp import GradScaler

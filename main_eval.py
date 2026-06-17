@@ -3,7 +3,10 @@
 # Copyright (C) 2023 Apple Inc. All Rights Reserved.
 #
 
+import os
 from typing import List, Optional
+
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 import torch
 

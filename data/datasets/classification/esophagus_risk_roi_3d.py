@@ -113,8 +113,10 @@ def _split_train_val_records(
     val_ratio: float,
     split_seed: int,
 ) -> tuple[list[CaseRecord], list[CaseRecord]]:
-    if not 0.0 < val_ratio < 1.0:
-        raise ValueError(f"val_ratio must be in (0, 1). Got: {val_ratio}")
+    if val_ratio < 0.0 or val_ratio >= 1.0:
+        raise ValueError(f"val_ratio must be in [0, 1). Got: {val_ratio}")
+    if val_ratio == 0.0:
+        return sorted(records, key=lambda item: item.case_id), []
 
     train_records: list[CaseRecord] = []
     val_records: list[CaseRecord] = []

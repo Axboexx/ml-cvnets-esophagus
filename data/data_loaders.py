@@ -133,7 +133,7 @@ def create_train_val_loader(
         collate_fn=partial(collate_fn_train, opts=opts)
         if collate_fn_train is not None
         else None,
-        prefetch_factor=prefetch_factor,
+        prefetch_factor=prefetch_factor if data_workers > 0 else None,
     )
 
     if valid_dataset is not None:
@@ -147,6 +147,7 @@ def create_train_val_loader(
             collate_fn=partial(collate_fn_val, opts=opts)
             if collate_fn_val is not None
             else None,
+            prefetch_factor=prefetch_factor if data_workers > 0 else None,
         )
     else:
         val_loader = None

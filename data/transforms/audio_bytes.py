@@ -9,9 +9,18 @@ from typing import Dict, Union
 
 import numpy as np
 import torch
-import torchaudio
 
 from data.transforms import TRANSFORMATIONS_REGISTRY, BaseTransformation
+from utils.import_utils import import_optional_module
+
+torchaudio, _torchaudio_import_error = import_optional_module("torchaudio")
+
+
+def _require_torchaudio() -> None:
+    if torchaudio is None:
+        raise ImportError(
+            "torchaudio is required for audio byte serialization, but it could not be imported."
+        ) from _torchaudio_import_error
 
 
 def _stream_to_wav(x: torch.Tensor, dtype: str, audio_fps: int) -> bytes:
@@ -28,6 +37,7 @@ def _stream_to_wav(x: torch.Tensor, dtype: str, audio_fps: int) -> bytes:
     Returns:
         The bytes of the wav file.
     """
+    _require_torchaudio()
     assert x.dtype == torch.float32
 
     if dtype == "float32":
@@ -106,6 +116,7 @@ class TorchaudioSave(BaseTransformation):
             data["samples"]["audio"] = buf
 
         elif self.format == "mp3":
+            _require_torchaudio()
             if x.dim() == 1:
                 x = x.reshape(1, -1)
             with tempfile.NamedTemporaryFile("rb+", suffix=".mp3") as f:

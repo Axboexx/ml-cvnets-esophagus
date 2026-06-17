@@ -7,16 +7,23 @@ import argparse
 
 import torch
 from torch import Tensor
-from torchtext.transforms import CLIPTokenizer
 
 from data.text_tokenizer import TOKENIZER_REGISTRY, BaseTokenizer
 from utils import logger
 from utils.download_utils import get_local_path
+from utils.import_utils import import_optional_module
 
 
 @TOKENIZER_REGISTRY.register(name="clip")
 class ClipTokenizer(BaseTokenizer):
     def __init__(self, opts, *args, **kwargs):
+        torchtext_transforms, import_error = import_optional_module("torchtext.transforms")
+        if torchtext_transforms is None:
+            logger.error(
+                "torchtext is required for CLIP tokenizer but could not be imported. "
+                f"Original error: {import_error}"
+            )
+
         merges_path = getattr(opts, "text_tokenizer.clip.merges_path", None)
         if merges_path is None:
             logger.error(
@@ -35,7 +42,7 @@ class ClipTokenizer(BaseTokenizer):
         encoder_json_path = get_local_path(opts, path=encoder_json_path)
 
         super().__init__(opts, *args, **kwargs)
-        self.tokenizer = CLIPTokenizer(
+        self.tokenizer = torchtext_transforms.CLIPTokenizer(
             merges_path=merges_path, encoder_json_path=encoder_json_path
         )
         # BPE encodings is a dict, where  keys are tokens and values are token_ids

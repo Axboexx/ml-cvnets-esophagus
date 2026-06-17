@@ -10,10 +10,19 @@ import random
 from typing import Callable, Dict, List, Optional, Union
 
 import torch
-import torchaudio
 
 from data.transforms import TRANSFORMATIONS_REGISTRY, BaseTransformation
 from data.transforms.audio_aux import mfccs
+from utils.import_utils import import_optional_module
+
+torchaudio, _torchaudio_import_error = import_optional_module("torchaudio")
+
+
+def _require_torchaudio() -> None:
+    if torchaudio is None:
+        raise ImportError(
+            "torchaudio is required for audio transforms, but it could not be imported."
+        ) from _torchaudio_import_error
 
 
 @TRANSFORMATIONS_REGISTRY.register(name="audio_gain", type="audio")
@@ -103,6 +112,7 @@ class Noise(BaseTransformation):
         """
         This method caches a list of noise files for on the fly augmentation.
         """
+        _require_torchaudio()
         noise_waves = []
         for i in range(cache_size):
             noise_wav_file = self.noise_files[self.pointer % len(self.noise_files)]
@@ -454,6 +464,7 @@ class AudioResample(BaseTransformation):
             }
         }
         """
+        _require_torchaudio()
         audio = data["samples"]["audio"]
 
         audio_rate = data["samples"]["metadata"]["audio_fps"]

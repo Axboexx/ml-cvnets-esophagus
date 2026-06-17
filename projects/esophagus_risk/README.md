@@ -53,16 +53,127 @@ cvnets-train \
     dataset.root_val=/path/to/val_root
 ```
 
+### SuPreM U-Net ROI fine-tuning
+
+The SuPreM experiment uses the same online `mask == 15` ROI crop dataset as the
+native 3D baseline, but replaces the compact 3D CNN with a SuPreM U-Net backbone
+and a classification head.
+
+Download the SuPreM U-Net checkpoint separately:
+
+```text
+supervised_suprem_unet_2100.pth
+```
+
+The SuPreM source repository is discovered from one of these locations:
+
+- `SUPREM_ROOT` environment variable
+- `../SuPreM/supervised_pretraining`
+- `~/work/SuPreM/supervised_pretraining`
+- `~/project/SuPreM/supervised_pretraining`
+
+Then run from the `ml-cvnets` root:
+
+```bash
+cvnets-train \
+  --common.config-file config/classification/esophagus_risk/suprem_unet_roi.yaml \
+  --common.results-loc results/suprem_unet_roi \
+  --common.override-kwargs \
+    dataset.root_train=/path/to/dataset_root \
+    model.classification.suprem_unet_roi.pretrained_path=/path/to/supervised_suprem_unet_2100.pth
+```
+
 If `dataset.root_val` is empty, the dataset performs an internal case-level split using:
 
 - `dataset.esophagus_roi_3d.val_split_ratio`
 - `dataset.esophagus_roi_3d.split_seed`
 
+### Youyi external test dataset
+
+The Youyi dataset uses separated CT and mask directories:
+
+```text
+youyi/
+  youyi-nii/
+    nhr/
+      1/
+      2/
+    hr/
+      1/
+      2/
+  youyi-mask/
+    nhr/
+      1/
+      2/
+    hr/
+      1/
+      2/
+```
+
+Use `esophagus_risk_youyi_roi_3d` for this layout. It pairs cases by the class
+folder (`nhr` or `hr`) and case folder name, then reuses the same ROI extraction
+and preprocessing settings from `dataset.esophagus_roi_3d`.
+
+Example evaluation command:
+
+```bash
+cvnets-eval \
+  --common.config-file config/classification/esophagus_risk/suprem_unet_roi.yaml \
+  --common.results-loc results/suprem_unet_roi \
+  --common.override-kwargs \
+    dataset.name=esophagus_risk_youyi_roi_3d \
+    dataset.root_test=/path/to/youyi \
+    model.classification.suprem_unet_roi.pretrained_path=/path/to/supervised_suprem_unet_2100.pth
+```
+
+### SuPreM Swin UNETR ROI fine-tuning
+
+This variant keeps the same ROI crop, labels, optimizer, and metrics as the
+SuPreM U-Net experiment, but uses the SuPreM Swin UNETR encoder feature before
+the decoder.
+
+Download the SuPreM Swin UNETR checkpoint separately:
+
+```text
+supervised_suprem_swinunetr_2100.pth
+```
+
+Then run from the `ml-cvnets` root:
+
+```bash
+cvnets-train \
+  --common.config-file config/classification/esophagus_risk/suprem_swinunetr_roi.yaml \
+  --common.results-loc results/suprem_swinunetr_roi \
+  --common.override-kwargs \
+    dataset.root_train=/path/to/dataset_root \
+    model.classification.suprem_swinunetr_roi.pretrained_path=/path/to/supervised_suprem_swinunetr_2100.pth
+```
+
+### Saved training metrics
+
+Each run writes lightweight analysis files under:
+
+```text
+<common.results-loc>/<common.run-label>/
+```
+
+Important files:
+
+- `training_metrics.jsonl`: one JSON record per epoch, including train/val loss, checkpoint metric, best metric, learning rate, iteration, and elapsed time.
+- `training_metrics.csv`: the same epoch-level metrics in spreadsheet-friendly format.
+- `validation_confusion_matrix.jsonl` / `validation_confusion_matrix.csv`: binary validation confusion matrix (`tn`, `fp`, `fn`, `tp`) and derived metrics per epoch, including Recall, F1-score, and AUC when model outputs are binary classification logits.
+- `training_run_summary.json`: run status, final training time, last epoch metrics, best metric, and error traceback if training failed.
+
 ### Main components
 
 - dataset: `data/datasets/classification/esophagus_risk_roi_3d.py`
+- Youyi test dataset: `data/datasets/classification/esophagus_risk_youyi_roi_3d.py`
 - model: `cvnets/models/classification/esophagus_roi_3d.py`
+- SuPreM model: `cvnets/models/classification/suprem_unet_roi.py`
+- SuPreM Swin UNETR model: `cvnets/models/classification/suprem_swinunetr_roi.py`
 - config: `config/classification/esophagus_risk/esophagus_roi_3d.yaml`
+- SuPreM config: `config/classification/esophagus_risk/suprem_unet_roi.yaml`
+- SuPreM Swin UNETR config: `config/classification/esophagus_risk/suprem_swinunetr_roi.yaml`
 
 ### Key assumptions
 
