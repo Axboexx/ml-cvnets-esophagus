@@ -1,0 +1,94 @@
+taskname: "+ E3a Multi-Organ ROI SuPreM U-Net Residual Context"
+common:
+  run_label: "train"
+  log_freq: 10
+  auto_resume: false
+  mixed_precision: true
+  channels_last: false
+  tensorboard_logging: false
+dataset:
+  root_train: ""
+  root_val: ""
+  root_test: ""
+  name: "esophagus_risk_e3a_multi_organ_roi_3d"
+  category: "classification"
+  train_batch_size0: 1
+  val_batch_size0: 1
+  eval_batch_size0: 1
+  workers: 4
+  persistent_workers: false
+  pin_memory: true
+  prefetch_factor: 2
+  e3a_multi_organ_roi_3d:
+    organ_names: "esophagus,liver,spleen,portal_venous_system"
+    label_ids: "15,5,1,64"
+    input_depth: 128
+    input_height: 160
+    input_width: 160
+    roi_margin_xy: "32,32,32,48"
+    roi_margin_z: "16,16,16,24"
+    required_organs: "esophagus"
+    val_split_ratio: 0.0
+    split_seed: 42
+    use_windowing: true
+    window_center: 50.0
+    window_width: 350.0
+    clip_percentile_lower: 0.5
+    clip_percentile_upper: 99.5
+sampler:
+  name: "batch_sampler"
+  bs:
+    crop_size_width: 160
+    crop_size_height: 160
+loss:
+  category: "classification"
+  classification:
+    name: "cross_entropy"
+    cross_entropy:
+      label_smoothing: 0.0
+optim:
+  name: "sgd"
+  weight_decay: 1.0e-5
+  no_decay_bn_filter_bias: true
+  sgd:
+    momentum: 0.9
+    nesterov: false
+scheduler:
+  name: "cosine"
+  is_iteration_based: false
+  max_epochs: 80
+  warmup_iterations: 100
+  warmup_init_lr: 1.0e-6
+  cosine:
+    max_lr: 1.0e-3
+    min_lr: 1.0e-6
+model:
+  classification:
+    name: "suprem_unet_e3a_residual_context"
+    classifier_dropout: 0.2
+    suprem_unet_e3a_residual_context:
+      pretrained_path: ""
+      require_pretrained: true
+      num_organs: 4
+      input_channels_per_organ: 2
+      context_scale: 1.0
+    activation:
+      name: "relu"
+      inplace: true
+  normalization:
+    name: "batch_norm"
+    momentum: 0.1
+  activation:
+    name: "relu"
+    inplace: true
+  layer:
+    global_pool: "mean"
+    conv_init: "kaiming_normal"
+    linear_init: "normal"
+ema:
+  enable: false
+stats:
+  val: ["loss", "top1"]
+  train: ["loss", "top1"]
+  checkpoint_metric: "top1"
+  checkpoint_metric_max: true
