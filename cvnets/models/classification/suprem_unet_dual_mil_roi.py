@@ -49,7 +49,7 @@ class SuPreMUNetDualMILRoi(BaseAnyNNModel):
             getattr(
                 opts,
                 "model.classification.suprem_unet_dual_mil_roi.num_segments",
-                6,
+                4,
             )
         )
         self.segment_depth = int(
@@ -147,7 +147,7 @@ class SuPreMUNetDualMILRoi(BaseAnyNNModel):
         group.add_argument(
             "--model.classification.suprem-unet-dual-mil-roi.num-segments",
             type=int,
-            default=6,
+            default=4,
             help="Number of depth-axis esophagus segments per case.",
         )
         group.add_argument(

@@ -23,7 +23,8 @@ from data.datasets.classification.esophagus_risk_roi_3d import (
     _to_depth_first,
 )
 from data.datasets.dataset_base import BaseDataset
-from projects.esophagus_risk.nifti_utils import read_nifti
+from projects.esophagus_risk.nifti_utils import read_nifti, validate_spatial_alignment
+from projects.esophagus_risk.roi_utils import inferior_to_superior_depth_bounds
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,13 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
         self.input_depth = int(getattr(opts, "dataset.e3a_multi_organ_roi_3d.input_depth"))
         self.input_height = int(getattr(opts, "dataset.e3a_multi_organ_roi_3d.input_height"))
         self.input_width = int(getattr(opts, "dataset.e3a_multi_organ_roi_3d.input_width"))
+        self.esophagus_inferior_to_superior_height_mm = float(
+            getattr(
+                opts,
+                "dataset.e3a_multi_organ_roi_3d.esophagus_inferior_to_superior_height_mm",
+                40.0,
+            )
+        )
         self.val_split_ratio = float(
             getattr(opts, "dataset.e3a_multi_organ_roi_3d.val_split_ratio")
         )
@@ -155,12 +163,17 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
         group.add_argument(
             "--dataset.e3a-multi-organ-roi-3d.roi-margin-xy",
             type=str,
-            default="32,32,32,48",
+            default="0,0,0,0",
         )
         group.add_argument(
             "--dataset.e3a-multi-organ-roi-3d.roi-margin-z",
             type=str,
-            default="16,16,16,24",
+            default="0,0,0,0",
+        )
+        group.add_argument(
+            "--dataset.e3a-multi-organ-roi-3d.esophagus-inferior-to-superior-height-mm",
+            type=float,
+            default=40.0,
         )
         group.add_argument(
             "--dataset.e3a-multi-organ-roi-3d.required-organs",
@@ -217,6 +230,10 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
             if getattr(self.opts, "dataset.root_test")
             else None
         )
+        resolved_train_root = train_root.resolve()
+
+        def is_distinct_root(candidate: Path | None) -> bool:
+            return candidate is not None and candidate.resolve() != resolved_train_root
 
         if self.mode == "train":
             all_records = _discover_records(train_root)
@@ -232,7 +249,7 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
             return train_records
 
         if self.mode == "val":
-            if val_root and val_root != train_root:
+            if is_distinct_root(val_root):
                 self.root = str(val_root)
                 return _discover_records(val_root)
 
@@ -248,9 +265,21 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
             self.root = str(train_root)
             return val_records
 
-        effective_test_root = test_root or val_root or train_root
-        self.root = str(effective_test_root)
-        return _discover_records(effective_test_root)
+        if is_distinct_root(test_root):
+            self.root = str(test_root)
+            return _discover_records(test_root)
+        if is_distinct_root(val_root):
+            self.root = str(val_root)
+            return _discover_records(val_root)
+
+        all_records = _discover_records(train_root)
+        _, test_records = _split_train_val_records(
+            all_records,
+            val_ratio=self.val_split_ratio,
+            split_seed=self.split_seed,
+        )
+        self.root = str(train_root)
+        return test_records
 
     def _parse_index(self, sample_size_and_index: Any) -> int:
         if isinstance(sample_size_and_index, (tuple, list)):
@@ -306,6 +335,8 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
         ct_volume: np.ndarray,
         mask_volume: np.ndarray,
         spec: OrganSpec,
+        slice_spacing_mm: float,
+        slice_axis_direction: int,
     ) -> torch.Tensor:
         organ_mask = mask_volume == spec.label_id
         coords = np.argwhere(organ_mask)
@@ -316,9 +347,38 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
 
         d_min, h_min, w_min = coords.min(axis=0).tolist()
         d_max, h_max, w_max = coords.max(axis=0).tolist()
-        d_start, d_end = _expand_bounds(d_min, d_max, ct_volume.shape[0], spec.margin_z)
-        h_start, h_end = _expand_bounds(h_min, h_max, ct_volume.shape[1], spec.margin_xy)
-        w_start, w_end = _expand_bounds(w_min, w_max, ct_volume.shape[2], spec.margin_xy)
+        if spec.name.lower() == "esophagus" and self.esophagus_inferior_to_superior_height_mm > 0.0:
+            d_start, d_end = inferior_to_superior_depth_bounds(
+                mask_depth_indices=coords[:, 0],
+                volume_depth=ct_volume.shape[0],
+                height_mm=self.esophagus_inferior_to_superior_height_mm,
+                slice_spacing_mm=slice_spacing_mm,
+                slice_axis_direction=slice_axis_direction,
+            )
+            segment_coords = np.argwhere(organ_mask[d_start:d_end])
+            h_min, w_min = segment_coords[:, 1:].min(axis=0).tolist()
+            h_max, w_max = segment_coords[:, 1:].max(axis=0).tolist()
+            h_start, h_end = h_min, h_max + 1
+            w_start, w_end = w_min, w_max + 1
+        else:
+            d_start, d_end = _expand_bounds(
+                d_min,
+                d_max,
+                ct_volume.shape[0],
+                spec.margin_z,
+            )
+            h_start, h_end = _expand_bounds(
+                h_min,
+                h_max,
+                ct_volume.shape[1],
+                spec.margin_xy,
+            )
+            w_start, w_end = _expand_bounds(
+                w_min,
+                w_max,
+                ct_volume.shape[2],
+                spec.margin_xy,
+            )
 
         ct_roi = ct_volume[d_start:d_end, h_start:h_end, w_start:w_end]
         mask_roi = organ_mask[d_start:d_end, h_start:h_end, w_start:w_end]
@@ -329,14 +389,19 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
         sample_index = self._parse_index(sample_size_and_index)
         record = self.records[sample_index]
 
-        ct_volume = _to_depth_first(read_nifti(record.ct_path).data.astype(np.float32, copy=False))
-        mask_volume = _to_depth_first(read_nifti(record.mask_path).data.astype(np.int32, copy=False))
+        ct_nifti = read_nifti(record.ct_path)
+        mask_nifti = read_nifti(record.mask_path)
+        validate_spatial_alignment(ct_nifti, mask_nifti, record.case_id)
+        ct_volume = _to_depth_first(ct_nifti.data.astype(np.float32, copy=False))
+        mask_volume = _to_depth_first(mask_nifti.data.astype(np.int32, copy=False))
 
         organ_tensors = [
             self._extract_organ_tensor(
                 ct_volume=ct_volume,
                 mask_volume=mask_volume,
                 spec=spec,
+                slice_spacing_mm=ct_nifti.spacing[2],
+                slice_axis_direction=ct_nifti.slice_axis_direction,
             )
             for spec in self.organ_specs
         ]
@@ -363,5 +428,7 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
             super().extra_repr()
             + f"\n\tnum_cases={len(self.records)}"
             + f"\n\torgans={organ_repr}"
+            + "\n\tesophagus_inferior_to_superior_height_mm="
+            + f"{self.esophagus_inferior_to_superior_height_mm}"
             + f"\n\troi_size=({self.input_depth}, {self.input_height}, {self.input_width})"
         )

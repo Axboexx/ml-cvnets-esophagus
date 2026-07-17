@@ -114,6 +114,15 @@ Use `esophagus_risk_youyi_roi_3d` for this layout. It pairs cases by the class
 folder (`nhr` or `hr`) and case folder name, then reuses the same ROI extraction
 and preprocessing settings from `dataset.esophagus_roi_3d`.
 
+The current protocol uses a deterministic, class-stratified Tongji 80/20 split
+(`val_split_ratio: 0.2`, `split_seed: 42`). The held-out 20% is reused by the
+framework as validation during training and as the internal test set during
+evaluation. Youyi remains a full, independent external test set.
+
+For multi-organ F3 experiments, every configured organ uses zero X/Y/Z margins.
+The esophagus keeps its inferior-to-superior 40 mm crop with tight X/Y bounds;
+liver, spleen, and portal venous system use their full tight 3D mask bounding boxes.
+
 Example evaluation command:
 
 ```bash
@@ -178,6 +187,9 @@ Important files:
 ### Key assumptions
 
 - esophagus label id is `15`
+- the crop starts at the inferior end and extends 40 mm toward the superior end
+- the X/Y bounds are the tight mask bounds within that 40 mm segment, with no margin
+- MIL local branches use 4 depth segments
 - input is resized to a fixed `3D` ROI size
 - training uses CT windowing by default
 - `common.channels_last` must remain `false` for this 3D path

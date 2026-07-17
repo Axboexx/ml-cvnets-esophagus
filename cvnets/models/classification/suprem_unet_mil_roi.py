@@ -46,7 +46,7 @@ class SuPreMUNetMILRoi(BaseAnyNNModel):
         pool_type = getattr(opts, "model.layer.global_pool")
 
         self.num_segments = int(
-            getattr(opts, "model.classification.suprem_unet_mil_roi.num_segments", 6)
+            getattr(opts, "model.classification.suprem_unet_mil_roi.num_segments", 4)
         )
         self.segment_depth = int(
             getattr(opts, "model.classification.suprem_unet_mil_roi.segment_depth", 48)
@@ -125,7 +125,7 @@ class SuPreMUNetMILRoi(BaseAnyNNModel):
         group.add_argument(
             "--model.classification.suprem-unet-mil-roi.num-segments",
             type=int,
-            default=6,
+            default=4,
             help="Number of depth-axis esophagus segments per case.",
         )
         group.add_argument(

@@ -17,7 +17,8 @@ from torch.nn import functional as F
 
 from data.datasets import DATASET_REGISTRY
 from data.datasets.dataset_base import BaseDataset
-from projects.esophagus_risk.nifti_utils import read_nifti
+from projects.esophagus_risk.nifti_utils import read_nifti, validate_spatial_alignment
+from projects.esophagus_risk.roi_utils import inferior_to_superior_depth_bounds
 
 
 _NEGATIVE_LABEL_NAMES = {
@@ -173,6 +174,9 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
         self.input_width = int(getattr(opts, "dataset.esophagus_roi_3d.input_width"))
         self.roi_margin_xy = int(getattr(opts, "dataset.esophagus_roi_3d.roi_margin_xy"))
         self.roi_margin_z = int(getattr(opts, "dataset.esophagus_roi_3d.roi_margin_z"))
+        self.inferior_to_superior_height_mm = float(
+            getattr(opts, "dataset.esophagus_roi_3d.inferior_to_superior_height_mm", 40.0)
+        )
         self.val_split_ratio = float(getattr(opts, "dataset.esophagus_roi_3d.val_split_ratio"))
         self.split_seed = int(getattr(opts, "dataset.esophagus_roi_3d.split_seed"))
         self.use_windowing = bool(getattr(opts, "dataset.esophagus_roi_3d.use_windowing"))
@@ -202,8 +206,13 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
         group.add_argument("--dataset.esophagus-roi-3d.input-depth", type=int, default=96)
         group.add_argument("--dataset.esophagus-roi-3d.input-height", type=int, default=96)
         group.add_argument("--dataset.esophagus-roi-3d.input-width", type=int, default=96)
-        group.add_argument("--dataset.esophagus-roi-3d.roi-margin-xy", type=int, default=24)
-        group.add_argument("--dataset.esophagus-roi-3d.roi-margin-z", type=int, default=8)
+        group.add_argument("--dataset.esophagus-roi-3d.roi-margin-xy", type=int, default=0)
+        group.add_argument("--dataset.esophagus-roi-3d.roi-margin-z", type=int, default=0)
+        group.add_argument(
+            "--dataset.esophagus-roi-3d.inferior-to-superior-height-mm",
+            type=float,
+            default=40.0,
+        )
         group.add_argument("--dataset.esophagus-roi-3d.val-split-ratio", type=float, default=0.2)
         group.add_argument("--dataset.esophagus-roi-3d.split-seed", type=int, default=42)
         group.add_argument(
@@ -242,6 +251,10 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
             if getattr(self.opts, "dataset.root_test")
             else None
         )
+        resolved_train_root = train_root.resolve()
+
+        def is_distinct_root(candidate: Path | None) -> bool:
+            return candidate is not None and candidate.resolve() != resolved_train_root
 
         if self.mode == "train":
             all_records = _discover_records(train_root)
@@ -254,7 +267,7 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
             return train_records
 
         if self.mode == "val":
-            if val_root and val_root != train_root:
+            if is_distinct_root(val_root):
                 self.root = str(val_root)
                 return _discover_records(val_root)
 
@@ -267,16 +280,34 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
             self.root = str(train_root)
             return val_records
 
-        effective_test_root = test_root or val_root or train_root
-        self.root = str(effective_test_root)
-        return _discover_records(effective_test_root)
+        if is_distinct_root(test_root):
+            self.root = str(test_root)
+            return _discover_records(test_root)
+        if is_distinct_root(val_root):
+            self.root = str(val_root)
+            return _discover_records(val_root)
+
+        all_records = _discover_records(train_root)
+        _, test_records = _split_train_val_records(
+            all_records,
+            val_ratio=self.val_split_ratio,
+            split_seed=self.split_seed,
+        )
+        self.root = str(train_root)
+        return test_records
 
     def _parse_index(self, sample_size_and_index: Any) -> int:
         if isinstance(sample_size_and_index, (tuple, list)):
             return int(sample_size_and_index[-1])
         return int(sample_size_and_index)
 
-    def _extract_roi(self, ct_volume: np.ndarray, mask_volume: np.ndarray) -> np.ndarray:
+    def _extract_roi(
+        self,
+        ct_volume: np.ndarray,
+        mask_volume: np.ndarray,
+        slice_spacing_mm: float,
+        slice_axis_direction: int,
+    ) -> np.ndarray:
         esophagus_mask = mask_volume == self.label_id
         coords = np.argwhere(esophagus_mask)
         if coords.size == 0:
@@ -285,9 +316,38 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
         d_min, h_min, w_min = coords.min(axis=0).tolist()
         d_max, h_max, w_max = coords.max(axis=0).tolist()
 
-        d_start, d_end = _expand_bounds(d_min, d_max, ct_volume.shape[0], self.roi_margin_z)
-        h_start, h_end = _expand_bounds(h_min, h_max, ct_volume.shape[1], self.roi_margin_xy)
-        w_start, w_end = _expand_bounds(w_min, w_max, ct_volume.shape[2], self.roi_margin_xy)
+        if self.inferior_to_superior_height_mm > 0.0:
+            d_start, d_end = inferior_to_superior_depth_bounds(
+                mask_depth_indices=coords[:, 0],
+                volume_depth=ct_volume.shape[0],
+                height_mm=self.inferior_to_superior_height_mm,
+                slice_spacing_mm=slice_spacing_mm,
+                slice_axis_direction=slice_axis_direction,
+            )
+            segment_coords = np.argwhere(esophagus_mask[d_start:d_end])
+            h_min, w_min = segment_coords[:, 1:].min(axis=0).tolist()
+            h_max, w_max = segment_coords[:, 1:].max(axis=0).tolist()
+            h_start, h_end = h_min, h_max + 1
+            w_start, w_end = w_min, w_max + 1
+        else:
+            d_start, d_end = _expand_bounds(
+                d_min,
+                d_max,
+                ct_volume.shape[0],
+                self.roi_margin_z,
+            )
+            h_start, h_end = _expand_bounds(
+                h_min,
+                h_max,
+                ct_volume.shape[1],
+                self.roi_margin_xy,
+            )
+            w_start, w_end = _expand_bounds(
+                w_min,
+                w_max,
+                ct_volume.shape[2],
+                self.roi_margin_xy,
+            )
         return ct_volume[d_start:d_end, h_start:h_end, w_start:w_end]
 
     def _normalize_roi(self, roi: np.ndarray) -> np.ndarray:
@@ -320,10 +380,18 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
         sample_index = self._parse_index(sample_size_and_index)
         record = self.records[sample_index]
 
-        ct_volume = _to_depth_first(read_nifti(record.ct_path).data.astype(np.float32, copy=False))
-        mask_volume = _to_depth_first(read_nifti(record.mask_path).data.astype(np.int32, copy=False))
+        ct_nifti = read_nifti(record.ct_path)
+        mask_nifti = read_nifti(record.mask_path)
+        validate_spatial_alignment(ct_nifti, mask_nifti, record.case_id)
+        ct_volume = _to_depth_first(ct_nifti.data.astype(np.float32, copy=False))
+        mask_volume = _to_depth_first(mask_nifti.data.astype(np.int32, copy=False))
 
-        roi = self._extract_roi(ct_volume=ct_volume, mask_volume=mask_volume)
+        roi = self._extract_roi(
+            ct_volume=ct_volume,
+            mask_volume=mask_volume,
+            slice_spacing_mm=ct_nifti.spacing[2],
+            slice_axis_direction=ct_nifti.slice_axis_direction,
+        )
         roi = self._normalize_roi(roi=roi)
         sample_tensor = self._resize_roi(roi=roi)
 
@@ -347,5 +415,6 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
             super().extra_repr()
             + f"\n\tnum_cases={len(self.records)}"
             + f"\n\tlabel_id={self.label_id}"
+            + f"\n\tinferior_to_superior_height_mm={self.inferior_to_superior_height_mm}"
             + f"\n\troi_size=({self.input_depth}, {self.input_height}, {self.input_width})"
         )
