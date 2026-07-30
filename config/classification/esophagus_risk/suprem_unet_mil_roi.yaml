@@ -1,6 +1,5 @@
 taskname: "+ Esophagus ROI SuPreM U-Net Segment MIL"
 common:
-  run_label: "train"
   log_freq: 10
   auto_resume: true
   mixed_precision: true
@@ -27,6 +26,7 @@ dataset:
     roi_margin_xy: 0
     roi_margin_z: 0
     inferior_to_superior_height_mm: 40.0
+    min_esophagus_height_mm: 40.0
     val_split_ratio: 0.2
     split_seed: 42
     use_windowing: true
@@ -55,7 +55,7 @@ optim:
 scheduler:
   name: "cosine"
   is_iteration_based: false
-  max_epochs: 300
+  max_epochs: 120
   warmup_iterations: 100
   warmup_init_lr: 1.0e-6
   cosine:

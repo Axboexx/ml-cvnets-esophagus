@@ -19,12 +19,14 @@ from data.datasets.classification.esophagus_risk_roi_3d import (
     CaseRecord,
     _discover_records,
     _expand_bounds,
+    _filter_records_by_esophagus_height,
     _split_train_val_records,
     _to_depth_first,
 )
 from data.datasets.dataset_base import BaseDataset
 from projects.esophagus_risk.nifti_utils import read_nifti, validate_spatial_alignment
 from projects.esophagus_risk.roi_utils import inferior_to_superior_depth_bounds
+from utils import logger
 
 
 @dataclass(frozen=True)
@@ -120,6 +122,13 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
                 40.0,
             )
         )
+        self.min_esophagus_height_mm = float(
+            getattr(
+                opts,
+                "dataset.e3a_multi_organ_roi_3d.min_esophagus_height_mm",
+                40.0,
+            )
+        )
         self.val_split_ratio = float(
             getattr(opts, "dataset.e3a_multi_organ_roi_3d.val_split_ratio")
         )
@@ -139,6 +148,8 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
         setattr(opts, "dataset.collate_fn_name_val", "image_classification_data_collate_fn")
         setattr(opts, "dataset.collate_fn_name_test", "image_classification_data_collate_fn")
 
+        self.num_cases_before_height_filter = 0
+        self.num_cases_excluded_by_height = 0
         self.records = self._load_records()
 
     @classmethod
@@ -172,6 +183,11 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
         )
         group.add_argument(
             "--dataset.e3a-multi-organ-roi-3d.esophagus-inferior-to-superior-height-mm",
+            type=float,
+            default=40.0,
+        )
+        group.add_argument(
+            "--dataset.e3a-multi-organ-roi-3d.min-esophagus-height-mm",
             type=float,
             default=40.0,
         )
@@ -218,6 +234,40 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
         )
         return parser
 
+    def _filter_short_esophagus_records(
+        self,
+        records: Sequence[CaseRecord],
+    ) -> list[CaseRecord]:
+        esophagus_spec = next(
+            (spec for spec in self.organ_specs if spec.name.lower() == "esophagus"),
+            None,
+        )
+        if esophagus_spec is None:
+            raise ValueError("E3a requires an esophagus organ specification for height filtering")
+
+        included, excluded = _filter_records_by_esophagus_height(
+            records=records,
+            label_id=esophagus_spec.label_id,
+            min_height_mm=self.min_esophagus_height_mm,
+        )
+        self.num_cases_before_height_filter = len(records)
+        self.num_cases_excluded_by_height = len(excluded)
+        if excluded:
+            examples = ", ".join(
+                f"{record.case_id} ({height_mm:.2f} mm)"
+                for record, height_mm in excluded[:5]
+            )
+            logger.log(
+                f"Excluded {len(excluded)} of {len(records)} E3a cases with esophagus "
+                f"height < {self.min_esophagus_height_mm:.2f} mm. Examples: {examples}"
+            )
+        if not included:
+            raise ValueError(
+                "No E3a cases remain after applying the minimum esophagus height filter "
+                f"({self.min_esophagus_height_mm:.2f} mm)."
+            )
+        return included
+
     def _load_records(self) -> list[CaseRecord]:
         train_root = Path(getattr(self.opts, "dataset.root_train")).expanduser()
         val_root = (
@@ -236,7 +286,9 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
             return candidate is not None and candidate.resolve() != resolved_train_root
 
         if self.mode == "train":
-            all_records = _discover_records(train_root)
+            all_records = self._filter_short_esophagus_records(
+                _discover_records(train_root)
+            )
             if self.val_split_ratio == 0.0:
                 self.root = str(train_root)
                 return sorted(all_records, key=lambda item: item.case_id)
@@ -251,9 +303,11 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
         if self.mode == "val":
             if is_distinct_root(val_root):
                 self.root = str(val_root)
-                return _discover_records(val_root)
+                return self._filter_short_esophagus_records(_discover_records(val_root))
 
-            all_records = _discover_records(train_root)
+            all_records = self._filter_short_esophagus_records(
+                _discover_records(train_root)
+            )
             if self.val_split_ratio == 0.0:
                 self.root = str(train_root)
                 return []
@@ -267,12 +321,12 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
 
         if is_distinct_root(test_root):
             self.root = str(test_root)
-            return _discover_records(test_root)
+            return self._filter_short_esophagus_records(_discover_records(test_root))
         if is_distinct_root(val_root):
             self.root = str(val_root)
-            return _discover_records(val_root)
+            return self._filter_short_esophagus_records(_discover_records(val_root))
 
-        all_records = _discover_records(train_root)
+        all_records = self._filter_short_esophagus_records(_discover_records(train_root))
         _, test_records = _split_train_val_records(
             all_records,
             val_ratio=self.val_split_ratio,
@@ -430,5 +484,7 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
             + f"\n\torgans={organ_repr}"
             + "\n\tesophagus_inferior_to_superior_height_mm="
             + f"{self.esophagus_inferior_to_superior_height_mm}"
+            + f"\n\tmin_esophagus_height_mm={self.min_esophagus_height_mm}"
+            + f"\n\tnum_cases_excluded_by_height={self.num_cases_excluded_by_height}"
             + f"\n\troi_size=({self.input_depth}, {self.input_height}, {self.input_width})"
         )

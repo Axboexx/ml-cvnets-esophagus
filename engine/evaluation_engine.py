@@ -14,6 +14,11 @@ import torch
 from torch import Tensor
 
 from common import DEFAULT_LOG_FREQ, SUPPORTED_VIDEO_CLIP_VOTING_FN
+from engine.classification_prediction_utils import (
+    build_binary_prediction_rows,
+    normalize_prediction_rows,
+    write_prediction_rows_csv,
+)
 from engine.utils import autocast_fn, get_batch_size, get_log_writers
 from metrics.stats import Statistics
 from options.parse_args import parse_validation_metric_names
@@ -42,19 +47,32 @@ class Evaluator(object):
         self.is_master_node = is_master(opts)
         self.stage_name = getattr(opts, "common.eval_stage_name", "evaluation")
         self.save_location = getattr(opts, "common.exp_loc", "results/eval")
-        self.metrics_jsonl_path = Path(self.save_location) / "external_eval_metrics.jsonl"
-        self.metrics_csv_path = Path(self.save_location) / "external_eval_metrics.csv"
+        artifact_prefix = (
+            "internal_eval"
+            if "internal" in self.stage_name.lower()
+            else "external_eval"
+        )
+        self.metrics_jsonl_path = (
+            Path(self.save_location) / f"{artifact_prefix}_metrics.jsonl"
+        )
+        self.metrics_csv_path = (
+            Path(self.save_location) / f"{artifact_prefix}_metrics.csv"
+        )
         self.confusion_jsonl_path = (
-            Path(self.save_location) / "external_eval_confusion_matrix.jsonl"
+            Path(self.save_location) / f"{artifact_prefix}_confusion_matrix.jsonl"
         )
         self.confusion_csv_path = (
-            Path(self.save_location) / "external_eval_confusion_matrix.csv"
+            Path(self.save_location) / f"{artifact_prefix}_confusion_matrix.csv"
         )
         self.misclassified_jsonl_path = (
-            Path(self.save_location) / "external_eval_misclassified_samples.jsonl"
+            Path(self.save_location)
+            / f"{artifact_prefix}_misclassified_samples.jsonl"
         )
         self.misclassified_csv_path = (
-            Path(self.save_location) / "external_eval_misclassified_samples.csv"
+            Path(self.save_location) / f"{artifact_prefix}_misclassified_samples.csv"
+        )
+        self.predictions_csv_path = (
+            Path(self.save_location) / f"{artifact_prefix}_predictions.csv"
         )
         self.metrics_csv_fields = [
             "stage",
@@ -293,11 +311,12 @@ class Evaluator(object):
         labels: Optional[list],
         probabilities: Optional[list],
         stage: str,
+        globally_aggregated: bool = False,
     ) -> Optional[Dict]:
         if confusion is None:
             return None
 
-        if self.use_distributed:
+        if self.use_distributed and not globally_aggregated:
             confusion = reduce_tensor_sum(confusion)
             gathered_labels = all_gather_list(labels or [])
             gathered_probabilities = all_gather_list(probabilities or [])
@@ -395,8 +414,34 @@ class Evaluator(object):
                 }
                 writer.writerow(row)
 
+    def _prepare_prediction_rows(self, rows: list) -> list:
+        if self.use_distributed:
+            gathered_rows = all_gather_list(rows)
+            rows = [row for worker_rows in gathered_rows for row in worker_rows]
+
+        expected_count = len(self.test_loader.dataset)
+        normalized_rows, duplicate_count = normalize_prediction_rows(
+            rows=rows, expected_count=expected_count
+        )
+        if duplicate_count and self.is_master_node:
+            logger.warning(
+                "Collapsed {} duplicate evaluation predictions introduced by "
+                "distributed sampling".format(duplicate_count)
+            )
+        return normalized_rows
+
+    def _write_prediction_rows(self, rows: list) -> None:
+        if not self.is_master_node:
+            return
+        write_prediction_rows_csv(
+            path=self.predictions_csv_path,
+            rows=rows,
+            preserve_other_partitions=False,
+        )
+
     def _record_classification_eval_outputs(
         self,
+        prediction_rows: list,
         confusion: Optional[Tensor],
         labels: list,
         probabilities: list,
@@ -405,19 +450,53 @@ class Evaluator(object):
         elapsed_seconds: float,
         ckpt_metric: Optional[float],
     ) -> None:
+        globally_aggregated = False
+        if prediction_rows:
+            prediction_rows = self._prepare_prediction_rows(prediction_rows)
+            labels = [int(row["target"]) for row in prediction_rows]
+            probabilities = [
+                float(row["positive_probability"]) for row in prediction_rows
+            ]
+            predictions = [int(row["prediction"]) for row in prediction_rows]
+            confusion = torch.tensor(
+                [
+                    sum(p == 0 and y == 0 for p, y in zip(predictions, labels)),
+                    sum(p == 1 and y == 0 for p, y in zip(predictions, labels)),
+                    sum(p == 0 and y == 1 for p, y in zip(predictions, labels)),
+                    sum(p == 1 and y == 1 for p, y in zip(predictions, labels)),
+                ],
+                dtype=torch.float64,
+                device=self.device,
+            )
+            globally_aggregated = True
         confusion_metrics = self._summarize_binary_confusion(
             confusion=confusion,
             labels=labels,
             probabilities=probabilities,
             stage=self.stage_name,
+            globally_aggregated=globally_aggregated,
         )
         self._append_confusion_metrics(confusion_metrics)
-
-        if self.use_distributed:
-            gathered_misclassified_samples = all_gather_list(misclassified_samples)
+        if prediction_rows:
+            self._write_prediction_rows(prediction_rows)
+            misclassified_samples = [
+                {
+                    "stage": row["stage"],
+                    "sample_index": row["sample_index"],
+                    "case_id": row["case_id"],
+                    "target": row["target"],
+                    "prediction": row["prediction"],
+                    "score": row["positive_probability"],
+                }
+                for row in prediction_rows
+                if not row["is_correct"]
+            ]
+            total_samples = len(prediction_rows)
+        elif self.use_distributed:
+            gathered_samples = all_gather_list(misclassified_samples)
             misclassified_samples = [
                 sample
-                for worker_samples in gathered_misclassified_samples
+                for worker_samples in gathered_samples
                 for sample in worker_samples
             ]
         self._append_misclassified_samples(misclassified_samples)
@@ -473,6 +552,7 @@ class Evaluator(object):
             binary_labels = []
             binary_probabilities = []
             misclassified_samples = []
+            prediction_rows = []
 
             for batch_id, batch in enumerate(self.test_loader):
                 batch = move_to_device(opts=self.opts, x=batch, device=self.device)
@@ -515,6 +595,16 @@ class Evaluator(object):
                             stage=self.stage_name,
                         )
                     )
+                    if "sample_id" in batch:
+                        prediction_rows.extend(
+                            build_binary_prediction_rows(
+                                prediction=pred_label,
+                                target=targets,
+                                sample_ids=batch["sample_id"],
+                                case_id_resolver=self._case_id_from_sample_index,
+                                stage=self.stage_name,
+                            )
+                        )
 
                 processed_samples += batch_size
 
@@ -542,6 +632,7 @@ class Evaluator(object):
             metric_name=self.ckpt_metric, sub_metric_name=self.ckpt_submetric
         )
         self._record_classification_eval_outputs(
+            prediction_rows=prediction_rows,
             confusion=confusion,
             labels=binary_labels,
             probabilities=binary_probabilities,

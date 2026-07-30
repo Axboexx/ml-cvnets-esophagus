@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 
@@ -13,9 +15,13 @@ from data.datasets.classification.esophagus_risk_e3a_multi_organ_roi_3d import (
 from data.datasets.classification.esophagus_risk_roi_3d import (
     CaseRecord,
     EsophagusRiskRoi3DDataset,
+    _filter_records_by_esophagus_height,
 )
 from data.datasets.classification.esophagus_risk_youyi_roi_3d import (
     EsophagusRiskYouyiRoi3DDataset,
+)
+from data.datasets.classification.esophagus_risk_youyi_e3a_multi_organ_roi_3d import (
+    EsophagusRiskYouyiE3aMultiOrganRoi3DDataset,
 )
 
 
@@ -54,10 +60,45 @@ def _record_loader(
     dataset.mode = mode
     dataset.val_split_ratio = 0.2
     dataset.split_seed = 42
+    dataset.label_id = 15
+    dataset.min_esophagus_height_mm = 0.0
     if dataset_class is EsophagusRiskYouyiRoi3DDataset:
         dataset.nii_dir_name = "youyi-nii"
         dataset.mask_dir_name = "youyi-mask"
     return dataset._load_records()
+
+
+def test_height_filter_excludes_only_esophagus_masks_below_40_mm(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    records: list[CaseRecord] = []
+    mask_volumes: dict[Path, SimpleNamespace] = {}
+    for case_id, num_slices in (("short", 19), ("exact", 20), ("long", 21)):
+        mask_path = tmp_path / f"{case_id}.nii.gz"
+        mask = np.zeros((4, 4, 30), dtype=np.int16)
+        mask[1:3, 1:3, 2 : 2 + num_slices] = 15
+        records.append(CaseRecord(case_id, 0, tmp_path / "ct.nii.gz", mask_path))
+        mask_volumes[mask_path] = SimpleNamespace(
+            data=mask,
+            spacing=(1.0, 1.0, 2.0),
+        )
+
+    monkeypatch.setattr(
+        "data.datasets.classification.esophagus_risk_roi_3d.read_nifti",
+        lambda path: mask_volumes[path],
+    )
+
+    included, excluded = _filter_records_by_esophagus_height(
+        records=records,
+        label_id=15,
+        min_height_mm=40.0,
+    )
+
+    assert [record.case_id for record in included] == ["exact", "long"]
+    assert [(record.case_id, height_mm) for record, height_mm in excluded] == [
+        ("short", 38.0)
+    ]
 
 
 def test_tongji_uses_same_stratified_holdout_for_validation_and_test(
@@ -87,6 +128,38 @@ def test_youyi_test_mode_keeps_the_full_external_dataset(tmp_path: Path) -> None
 
     assert len(records) == 6
     assert {record.label for record in records} == {0, 1}
+
+
+def test_youyi_e3a_test_mode_applies_esophagus_height_filter(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    _make_youyi_dataset(tmp_path)
+    dataset = object.__new__(EsophagusRiskYouyiE3aMultiOrganRoi3DDataset)
+    dataset.opts = argparse.Namespace()
+    setattr(dataset.opts, "dataset.root_train", "")
+    setattr(dataset.opts, "dataset.root_val", "")
+    setattr(dataset.opts, "dataset.root_test", str(tmp_path))
+    dataset.mode = "test"
+    dataset.nii_dir_name = "youyi-nii"
+    dataset.mask_dir_name = "youyi-mask"
+    filter_calls: list[list[CaseRecord]] = []
+
+    def record_filter(records: list[CaseRecord]) -> list[CaseRecord]:
+        filter_calls.append(records)
+        dataset.num_cases_before_height_filter = len(records)
+        dataset.num_cases_excluded_by_height = 1
+        return records[1:]
+
+    monkeypatch.setattr(dataset, "_filter_short_esophagus_records", record_filter)
+
+    records = dataset._load_records()
+
+    assert len(filter_calls) == 1
+    assert len(filter_calls[0]) == 6
+    assert len(records) == 5
+    assert dataset.num_cases_before_height_filter == 6
+    assert dataset.num_cases_excluded_by_height == 1
 
 
 def test_equivalent_test_root_does_not_bypass_tongji_holdout(tmp_path: Path) -> None:

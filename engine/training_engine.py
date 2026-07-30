@@ -22,6 +22,11 @@ from torch.nn import functional as F
 
 from common import DEFAULT_EPOCHS, DEFAULT_ITERATIONS, DEFAULT_LOG_FREQ, if_test_env
 from data.transforms.image_torch import apply_mixing_transforms
+from engine.classification_prediction_utils import (
+    build_binary_prediction_rows,
+    normalize_prediction_rows,
+    write_prediction_rows_csv,
+)
 from engine.utils import autocast_fn, get_batch_size, get_log_writers, log_metrics
 from loss_landscape import landscape_utils as ll_utils
 from metrics.stats import Statistics
@@ -132,6 +137,9 @@ class Trainer(object):
         )
         self.misclassified_csv_path = (
             Path(self.save_location) / "validation_misclassified_samples.csv"
+        )
+        self.predictions_csv_path = (
+            Path(self.save_location) / "validation_predictions.csv"
         )
         self.metrics_csv_fields = [
             "epoch",
@@ -435,11 +443,12 @@ class Trainer(object):
         probabilities: Optional[list],
         epoch: int,
         stage: str,
+        globally_aggregated: bool = False,
     ) -> Optional[Dict]:
         if confusion is None:
             return None
 
-        if self.use_distributed:
+        if self.use_distributed and not globally_aggregated:
             confusion = reduce_tensor_sum(confusion)
             gathered_labels = all_gather_list(labels or [])
             gathered_probabilities = all_gather_list(probabilities or [])
@@ -481,6 +490,31 @@ class Trainer(object):
             "f1_score": f1,
             "auc": auc,
         }
+
+    def _prepare_prediction_rows(self, rows: list) -> list:
+        if self.use_distributed:
+            gathered_rows = all_gather_list(rows)
+            rows = [row for worker_rows in gathered_rows for row in worker_rows]
+
+        expected_count = len(self.val_loader.dataset)
+        normalized_rows, duplicate_count = normalize_prediction_rows(
+            rows=rows, expected_count=expected_count
+        )
+        if duplicate_count and self.is_master_node:
+            logger.warning(
+                "Collapsed {} duplicate validation predictions introduced by "
+                "distributed sampling".format(duplicate_count)
+            )
+        return normalized_rows
+
+    def _write_prediction_rows(self, rows: list) -> None:
+        if not self.is_master_node:
+            return
+        write_prediction_rows_csv(
+            path=self.predictions_csv_path,
+            rows=rows,
+            preserve_other_partitions=True,
+        )
 
     def _append_confusion_metrics(self, metrics: Optional[Dict]) -> None:
         if not self.is_master_node or metrics is None:
@@ -775,6 +809,7 @@ class Trainer(object):
             binary_labels = []
             binary_probabilities = []
             misclassified_samples = []
+            prediction_rows = []
             for batch_id, batch in enumerate(self.val_loader):
                 batch = move_to_device(opts=self.opts, x=batch, device=self.device)
 
@@ -817,6 +852,17 @@ class Trainer(object):
                             stage="validation" + extra_str,
                         )
                     )
+                    if "sample_id" in batch:
+                        prediction_rows.extend(
+                            build_binary_prediction_rows(
+                                prediction=pred_label,
+                                target=targets,
+                                sample_ids=batch["sample_id"],
+                                case_id_resolver=self._case_id_from_sample_index,
+                                epoch=epoch,
+                                stage="validation" + extra_str,
+                            )
+                        )
                     # compute loss
                     loss_dict_or_tensor = self.criteria(
                         input_sample=samples,
@@ -854,19 +900,54 @@ class Trainer(object):
         if avg_ckpt_metric is None:
             avg_ckpt_metric = avg_loss
 
+        globally_aggregated = False
+        if prediction_rows:
+            prediction_rows = self._prepare_prediction_rows(prediction_rows)
+            binary_labels = [int(row["target"]) for row in prediction_rows]
+            binary_probabilities = [
+                float(row["positive_probability"]) for row in prediction_rows
+            ]
+            predictions = [int(row["prediction"]) for row in prediction_rows]
+            confusion = torch.tensor(
+                [
+                    sum(p == 0 and y == 0 for p, y in zip(predictions, binary_labels)),
+                    sum(p == 1 and y == 0 for p, y in zip(predictions, binary_labels)),
+                    sum(p == 0 and y == 1 for p, y in zip(predictions, binary_labels)),
+                    sum(p == 1 and y == 1 for p, y in zip(predictions, binary_labels)),
+                ],
+                dtype=torch.float64,
+                device=self.device,
+            )
+            globally_aggregated = True
         confusion_metrics = self._summarize_binary_confusion(
             confusion=confusion,
             labels=binary_labels,
             probabilities=binary_probabilities,
             epoch=epoch,
             stage="validation" + extra_str,
+            globally_aggregated=globally_aggregated,
         )
         self._append_confusion_metrics(confusion_metrics)
-        if self.use_distributed:
-            gathered_misclassified_samples = all_gather_list(misclassified_samples)
+        if prediction_rows:
+            self._write_prediction_rows(prediction_rows)
+            misclassified_samples = [
+                {
+                    "epoch": row["epoch"],
+                    "stage": row["stage"],
+                    "sample_index": row["sample_index"],
+                    "case_id": row["case_id"],
+                    "target": row["target"],
+                    "prediction": row["prediction"],
+                    "score": row["positive_probability"],
+                }
+                for row in prediction_rows
+                if not row["is_correct"]
+            ]
+        elif self.use_distributed:
+            gathered_samples = all_gather_list(misclassified_samples)
             misclassified_samples = [
                 sample
-                for worker_samples in gathered_misclassified_samples
+                for worker_samples in gathered_samples
                 for sample in worker_samples
             ]
         self._append_misclassified_samples(misclassified_samples)

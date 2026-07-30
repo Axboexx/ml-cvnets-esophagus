@@ -54,10 +54,12 @@ class EsophagusRiskYouyiE3aMultiOrganRoi3DDataset(EsophagusRiskE3aMultiOrganRoi3
         )
 
         if self.mode == "train":
-            all_records = _discover_youyi_records(
-                train_root,
-                nii_dir_name=self.nii_dir_name,
-                mask_dir_name=self.mask_dir_name,
+            all_records = self._filter_short_esophagus_records(
+                _discover_youyi_records(
+                    train_root,
+                    nii_dir_name=self.nii_dir_name,
+                    mask_dir_name=self.mask_dir_name,
+                )
             )
             train_records, _ = _split_train_val_records(
                 all_records,
@@ -70,16 +72,20 @@ class EsophagusRiskYouyiE3aMultiOrganRoi3DDataset(EsophagusRiskE3aMultiOrganRoi3
         if self.mode == "val":
             if val_root and val_root != train_root:
                 self.root = str(val_root)
-                return _discover_youyi_records(
-                    val_root,
+                return self._filter_short_esophagus_records(
+                    _discover_youyi_records(
+                        val_root,
+                        nii_dir_name=self.nii_dir_name,
+                        mask_dir_name=self.mask_dir_name,
+                    )
+                )
+
+            all_records = self._filter_short_esophagus_records(
+                _discover_youyi_records(
+                    train_root,
                     nii_dir_name=self.nii_dir_name,
                     mask_dir_name=self.mask_dir_name,
                 )
-
-            all_records = _discover_youyi_records(
-                train_root,
-                nii_dir_name=self.nii_dir_name,
-                mask_dir_name=self.mask_dir_name,
             )
             _, val_records = _split_train_val_records(
                 all_records,
@@ -91,8 +97,10 @@ class EsophagusRiskYouyiE3aMultiOrganRoi3DDataset(EsophagusRiskE3aMultiOrganRoi3
 
         effective_test_root = test_root or val_root or train_root
         self.root = str(effective_test_root)
-        return _discover_youyi_records(
-            effective_test_root,
-            nii_dir_name=self.nii_dir_name,
-            mask_dir_name=self.mask_dir_name,
+        return self._filter_short_esophagus_records(
+            _discover_youyi_records(
+                effective_test_root,
+                nii_dir_name=self.nii_dir_name,
+                mask_dir_name=self.mask_dir_name,
+            )
         )

@@ -27,6 +27,7 @@ dataset:
     roi_margin_xy: 0
     roi_margin_z: 0
     inferior_to_superior_height_mm: 40.0
+    min_esophagus_height_mm: 40.0
     val_split_ratio: 0.2
     split_seed: 42
     use_windowing: true

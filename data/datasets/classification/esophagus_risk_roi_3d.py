@@ -19,6 +19,7 @@ from data.datasets import DATASET_REGISTRY
 from data.datasets.dataset_base import BaseDataset
 from projects.esophagus_risk.nifti_utils import read_nifti, validate_spatial_alignment
 from projects.esophagus_risk.roi_utils import inferior_to_superior_depth_bounds
+from utils import logger
 
 
 _NEGATIVE_LABEL_NAMES = {
@@ -146,6 +147,55 @@ def _split_train_val_records(
     )
 
 
+def _esophagus_mask_height_mm(
+    mask_volume: np.ndarray,
+    label_id: int,
+    slice_spacing_mm: float,
+) -> float:
+    """Measure the inclusive axial span of an esophagus mask in millimetres."""
+    if mask_volume.ndim != 3:
+        raise ValueError(f"Expected a 3D mask, got shape {mask_volume.shape}")
+    if not np.isfinite(slice_spacing_mm) or slice_spacing_mm <= 0.0:
+        raise ValueError(f"Invalid slice spacing: {slice_spacing_mm}")
+
+    depth_indices = np.flatnonzero(np.any(mask_volume == label_id, axis=(0, 1)))
+    if depth_indices.size == 0:
+        raise ValueError(f"Esophagus label {label_id} is missing in mask")
+    num_slices = int(depth_indices[-1] - depth_indices[0] + 1)
+    return float(num_slices * slice_spacing_mm)
+
+
+def _filter_records_by_esophagus_height(
+    records: Sequence[CaseRecord],
+    label_id: int,
+    min_height_mm: float,
+) -> tuple[list[CaseRecord], list[tuple[CaseRecord, float]]]:
+    """Keep only cases whose esophagus mask spans at least ``min_height_mm``."""
+    if not np.isfinite(min_height_mm) or min_height_mm < 0.0:
+        raise ValueError(f"min_height_mm must be finite and non-negative, got {min_height_mm}")
+    if min_height_mm == 0.0:
+        return list(records), []
+
+    included: list[CaseRecord] = []
+    excluded: list[tuple[CaseRecord, float]] = []
+    for record in records:
+        mask_nifti = read_nifti(record.mask_path)
+        try:
+            height_mm = _esophagus_mask_height_mm(
+                mask_volume=mask_nifti.data,
+                label_id=label_id,
+                slice_spacing_mm=mask_nifti.spacing[2],
+            )
+        except ValueError as error:
+            raise ValueError(f"Invalid esophagus mask for {record.case_id}: {error}") from error
+
+        if height_mm + 1.0e-6 >= min_height_mm:
+            included.append(record)
+        else:
+            excluded.append((record, height_mm))
+    return included, excluded
+
+
 def _to_depth_first(volume: np.ndarray) -> np.ndarray:
     if volume.ndim != 3:
         raise ValueError(f"Expected a 3D volume, got shape {volume.shape}")
@@ -176,6 +226,9 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
         self.roi_margin_z = int(getattr(opts, "dataset.esophagus_roi_3d.roi_margin_z"))
         self.inferior_to_superior_height_mm = float(
             getattr(opts, "dataset.esophagus_roi_3d.inferior_to_superior_height_mm", 40.0)
+        )
+        self.min_esophagus_height_mm = float(
+            getattr(opts, "dataset.esophagus_roi_3d.min_esophagus_height_mm", 40.0)
         )
         self.val_split_ratio = float(getattr(opts, "dataset.esophagus_roi_3d.val_split_ratio"))
         self.split_seed = int(getattr(opts, "dataset.esophagus_roi_3d.split_seed"))
@@ -213,6 +266,11 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
             type=float,
             default=40.0,
         )
+        group.add_argument(
+            "--dataset.esophagus-roi-3d.min-esophagus-height-mm",
+            type=float,
+            default=40.0,
+        )
         group.add_argument("--dataset.esophagus-roi-3d.val-split-ratio", type=float, default=0.2)
         group.add_argument("--dataset.esophagus-roi-3d.split-seed", type=int, default=42)
         group.add_argument(
@@ -239,6 +297,33 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
         )
         return parser
 
+    def _filter_short_esophagus_records(
+        self,
+        records: Sequence[CaseRecord],
+    ) -> list[CaseRecord]:
+        included, excluded = _filter_records_by_esophagus_height(
+            records=records,
+            label_id=self.label_id,
+            min_height_mm=self.min_esophagus_height_mm,
+        )
+        self.num_cases_before_height_filter = len(records)
+        self.num_cases_excluded_by_height = len(excluded)
+        if excluded:
+            examples = ", ".join(
+                f"{record.case_id} ({height_mm:.2f} mm)"
+                for record, height_mm in excluded[:5]
+            )
+            logger.log(
+                f"Excluded {len(excluded)} of {len(records)} cases with esophagus height "
+                f"< {self.min_esophagus_height_mm:.2f} mm. Examples: {examples}"
+            )
+        if not included:
+            raise ValueError(
+                "No cases remain after applying the minimum esophagus height filter "
+                f"({self.min_esophagus_height_mm:.2f} mm)."
+            )
+        return included
+
     def _load_records(self) -> list[CaseRecord]:
         train_root = Path(getattr(self.opts, "dataset.root_train")).expanduser()
         val_root = (
@@ -257,7 +342,9 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
             return candidate is not None and candidate.resolve() != resolved_train_root
 
         if self.mode == "train":
-            all_records = _discover_records(train_root)
+            all_records = self._filter_short_esophagus_records(
+                _discover_records(train_root)
+            )
             train_records, _ = _split_train_val_records(
                 all_records,
                 val_ratio=self.val_split_ratio,
@@ -269,9 +356,11 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
         if self.mode == "val":
             if is_distinct_root(val_root):
                 self.root = str(val_root)
-                return _discover_records(val_root)
+                return self._filter_short_esophagus_records(_discover_records(val_root))
 
-            all_records = _discover_records(train_root)
+            all_records = self._filter_short_esophagus_records(
+                _discover_records(train_root)
+            )
             _, val_records = _split_train_val_records(
                 all_records,
                 val_ratio=self.val_split_ratio,
@@ -282,12 +371,12 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
 
         if is_distinct_root(test_root):
             self.root = str(test_root)
-            return _discover_records(test_root)
+            return self._filter_short_esophagus_records(_discover_records(test_root))
         if is_distinct_root(val_root):
             self.root = str(val_root)
-            return _discover_records(val_root)
+            return self._filter_short_esophagus_records(_discover_records(val_root))
 
-        all_records = _discover_records(train_root)
+        all_records = self._filter_short_esophagus_records(_discover_records(train_root))
         _, test_records = _split_train_val_records(
             all_records,
             val_ratio=self.val_split_ratio,
@@ -416,5 +505,7 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
             + f"\n\tnum_cases={len(self.records)}"
             + f"\n\tlabel_id={self.label_id}"
             + f"\n\tinferior_to_superior_height_mm={self.inferior_to_superior_height_mm}"
+            + f"\n\tmin_esophagus_height_mm={self.min_esophagus_height_mm}"
+            + f"\n\tnum_cases_excluded_by_height={self.num_cases_excluded_by_height}"
             + f"\n\troi_size=({self.input_depth}, {self.input_height}, {self.input_width})"
         )
