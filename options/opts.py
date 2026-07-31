@@ -162,6 +162,15 @@ def arguments_common(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
         help="Keep k-best checkpoints",
     )
     group.add_argument(
+        "--common.k-best-auc-checkpoints",
+        type=int,
+        default=5,
+        help=(
+            "Keep model weights for the top-k validation AUC values without "
+            "creating an averaged or resume checkpoint"
+        ),
+    )
+    group.add_argument(
         "--common.save-all-checkpoints",
         action="store_true",
         default=False,

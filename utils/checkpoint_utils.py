@@ -7,6 +7,7 @@ import argparse
 import glob
 import math
 import os
+import re
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -19,6 +20,9 @@ from utils.ddp_utils import is_master
 from utils.download_utils import get_local_path
 
 CHECKPOINT_EXTN = "pt"
+_AUC_CHECKPOINT_PATTERN = re.compile(
+    rf"^checkpoint_auc_epoch_(\d+)_score_([0-9]+\.[0-9]+)\.{CHECKPOINT_EXTN}$"
+)
 
 
 def get_model_state_dict(model: torch.nn.Module) -> Dict:
@@ -152,6 +156,79 @@ def avg_and_save_k_checkpoints(
     except Exception as e:
         logger.log("Error in k-best-checkpoint")
         print(e)
+
+
+def save_top_k_auc_checkpoints(
+    model_state: Dict,
+    auc: float,
+    epoch: int,
+    save_dir: str,
+    k_best_checkpoints: int,
+) -> None:
+    """Save model weights for the globally highest validation AUC values.
+
+    This checkpoint family is independent from the primary checkpoint metric.
+    It stores model weights only and intentionally does not create an averaged
+    model or a second training-resume checkpoint.
+
+    Args:
+        model_state: ``state_dict`` containing model parameters.
+        auc: Case-level validation AUC for the current epoch.
+        epoch: Current training epoch.
+        save_dir: Directory in which checkpoints are stored.
+        k_best_checkpoints: Maximum number of AUC-ranked checkpoints to retain.
+    """
+    if k_best_checkpoints <= 0:
+        return
+    if not math.isfinite(auc):
+        logger.warning(
+            "Skipping AUC checkpoint for epoch {} because AUC is not finite".format(
+                epoch
+            )
+        )
+        return
+
+    checkpoint_pattern = os.path.join(
+        save_dir, "checkpoint_auc_epoch_*_score_*.{}".format(CHECKPOINT_EXTN)
+    )
+    current_epoch_pattern = os.path.join(
+        save_dir,
+        "checkpoint_auc_epoch_{:04d}_score_*.{}".format(epoch, CHECKPOINT_EXTN),
+    )
+    checkpoint_path = os.path.join(
+        save_dir,
+        "checkpoint_auc_epoch_{:04d}_score_{:.8f}.{}".format(
+            epoch, auc, CHECKPOINT_EXTN
+        ),
+    )
+    torch.save(model_state, checkpoint_path)
+    for previous_checkpoint_path in glob.glob(current_epoch_pattern):
+        if previous_checkpoint_path != checkpoint_path:
+            os.remove(previous_checkpoint_path)
+
+    ranked_checkpoints = []
+    for candidate_path in glob.glob(checkpoint_pattern):
+        match = _AUC_CHECKPOINT_PATTERN.match(os.path.basename(candidate_path))
+        if match is None:
+            logger.warning(
+                "Ignoring unrecognized AUC checkpoint name: {}".format(candidate_path)
+            )
+            continue
+        ranked_checkpoints.append(
+            (float(match.group(2)), int(match.group(1)), candidate_path)
+        )
+
+    ranked_checkpoints.sort(key=lambda item: (-item[0], item[1], item[2]))
+    for _, _, checkpoint_to_remove in ranked_checkpoints[k_best_checkpoints:]:
+        os.remove(checkpoint_to_remove)
+        logger.log("Deleting AUC checkpoint: {}".format(checkpoint_to_remove))
+
+    if os.path.isfile(checkpoint_path):
+        logger.log(
+            "Validation AUC checkpoint with score {:.8f} saved at {}".format(
+                auc, checkpoint_path
+            )
+        )
 
 
 def save_interval_checkpoint(

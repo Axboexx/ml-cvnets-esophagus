@@ -34,8 +34,10 @@ from options.parse_args import parse_validation_metric_names
 from utils import logger
 from utils.checkpoint_utils import (
     copy_weights,
+    get_model_state_dict,
     save_checkpoint,
     save_interval_checkpoint,
+    save_top_k_auc_checkpoints,
 )
 from utils.common_utils import move_to_device, unwrap_model_fn
 from utils.ddp_utils import dist_barrier, is_master
@@ -1116,6 +1118,9 @@ class Trainer(object):
             )
 
         keep_k_best_ckpts = getattr(self.opts, "common.k_best_checkpoints", 5)
+        keep_k_best_auc_ckpts = getattr(
+            self.opts, "common.k_best_auc_checkpoints", 5
+        )
         ema_best_metric = self.best_metric
         is_ema_best = False
 
@@ -1155,7 +1160,11 @@ class Trainer(object):
                     if self.is_master_node:
                         logger.log("EMA weights copied")
                         logger.log("Running validation after Copying EMA model weights")
-                    self.val_epoch(epoch=epoch, model=self.model)
+                    (
+                        val_loss,
+                        val_ckpt_metric,
+                        val_confusion_metrics,
+                    ) = self.val_epoch(epoch=epoch, model=self.model)
 
                 checkpoint_metric = (
                     val_ckpt_metric if validation_enabled else train_ckpt_metric
@@ -1224,6 +1233,18 @@ class Trainer(object):
                         k_best_checkpoints=keep_k_best_ckpts,
                         save_all_checkpoints=self.save_all_checkpoints,
                     )
+                    if (
+                        validation_enabled
+                        and val_confusion_metrics is not None
+                        and val_confusion_metrics.get("auc") is not None
+                    ):
+                        save_top_k_auc_checkpoints(
+                            model_state=get_model_state_dict(self.model),
+                            auc=float(val_confusion_metrics["auc"]),
+                            epoch=epoch,
+                            save_dir=self.save_location,
+                            k_best_checkpoints=keep_k_best_auc_ckpts,
+                        )
                     logger.info(
                         "Checkpoints saved at: {}".format(self.save_location),
                         print_line=True,
