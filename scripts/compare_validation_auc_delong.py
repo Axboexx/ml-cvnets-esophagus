@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare validation ROC AUCs with paired DeLong tests."""
+"""Compare validation or external ROC AUCs with paired DeLong tests."""
 
 import argparse
 import csv
@@ -87,9 +87,21 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
 def _markdown_summary(
     model_rows: Sequence[Mapping[str, object]],
     pair_rows: Sequence[Mapping[str, object]],
+    analysis_set: str,
 ) -> str:
+    title = "Validation" if analysis_set == "validation" else "External validation"
+    if analysis_set == "validation":
+        interpretation = (
+            "These are internal validation comparisons after validation-based "
+            "checkpoint selection and should be interpreted as exploratory."
+        )
+    else:
+        interpretation = (
+            "These are external validation comparisons of checkpoints fixed before "
+            "external evaluation and quantify independent generalization evidence."
+        )
     lines = [
-        "# Validation AUC paired DeLong analysis",
+        f"# {title} AUC paired DeLong analysis",
         "",
         "## Model AUC",
         "",
@@ -124,8 +136,7 @@ def _markdown_summary(
             "P values are two-sided paired DeLong tests and are Holm-adjusted "
             "across all listed comparisons.",
             "",
-            "These are internal validation comparisons after validation-based "
-            "checkpoint selection and should be interpreted as exploratory.",
+            interpretation,
             "",
         ]
     )
@@ -141,6 +152,7 @@ def write_results(
     scores: NDArray[np.float64],
     alpha: float,
     input_hashes: Mapping[Path, str],
+    analysis_set: str = "validation",
 ) -> None:
     """Compute results in a temporary directory, then atomically publish them."""
     if alpha != 0.05:
@@ -199,6 +211,7 @@ def write_results(
         "method": "paired DeLong test for correlated ROC AUCs",
         "confidence_interval": "two-sided 95% normal-approximation DeLong CI",
         "multiple_testing": "Holm correction over all pairwise comparisons",
+        "analysis_set": analysis_set,
         "stage": stage,
         "alpha": alpha,
         "n_cases": len(case_ids),
@@ -237,6 +250,10 @@ def write_results(
         "interpretation_boundary": (
             "Internal validation inference after validation-based checkpoint "
             "selection; treat as exploratory, not external generalization."
+            if analysis_set == "validation"
+            else "External validation inference for checkpoints fixed before "
+            "external evaluation; do not use these results for model, checkpoint, "
+            "hyperparameter, or threshold selection."
         ),
     }
 
@@ -256,7 +273,7 @@ def write_results(
             json.dump(metadata, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
         (temporary_dir / "README.md").write_text(
-            _markdown_summary(model_rows, pair_rows), encoding="utf-8"
+            _markdown_summary(model_rows, pair_rows, analysis_set), encoding="utf-8"
         )
         if output_dir.exists():
             raise FileExistsError(f"output directory already exists: {output_dir}")
@@ -273,7 +290,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         required=True,
         metavar="NAME=CSV",
-        help="Model name and validation_predictions.csv; repeat per model.",
+        help="Model name and case-level prediction CSV; repeat per model.",
     )
     parser.add_argument(
         "--metrics",
@@ -289,7 +306,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME=EPOCH",
         help="Optional selected-epoch override; repeat as needed.",
     )
-    parser.add_argument("--stage", default="validation")
+    parser.add_argument(
+        "--analysis-set",
+        choices=("validation", "external"),
+        default="validation",
+        help="Evaluation role; external mode accepts prediction CSVs with blank epoch.",
+    )
+    parser.add_argument(
+        "--stage",
+        default=None,
+        help="Exact stage value in prediction CSV (default: validation or evaluation).",
+    )
     parser.add_argument("--alpha", type=float, default=0.05)
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser
@@ -298,25 +325,30 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        stage = args.stage or (
+            "validation" if args.analysis_set == "validation" else "evaluation"
+        )
         model_inputs = resolve_model_inputs(
             model_values=args.model,
             metrics_values=args.metrics,
             epoch_values=args.epoch,
+            analysis_set=args.analysis_set,
         )
         input_hashes = capture_input_hashes(model_inputs)
         case_ids, targets, scores = align_predictions(
             model_inputs=model_inputs,
-            stage=args.stage,
+            stage=stage,
         )
         write_results(
             output_dir=args.output_dir.expanduser().resolve(),
             model_inputs=model_inputs,
-            stage=args.stage,
+            stage=stage,
             case_ids=case_ids,
             targets=targets,
             scores=scores,
             alpha=args.alpha,
             input_hashes=input_hashes,
+            analysis_set=args.analysis_set,
         )
     except (FileExistsError, FileNotFoundError, ValueError) as error:
         raise SystemExit(f"error: {error}") from error

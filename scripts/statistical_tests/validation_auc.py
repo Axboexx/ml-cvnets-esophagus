@@ -1,4 +1,4 @@
-"""Input validation and case alignment for validation-set AUC comparisons."""
+"""Input validation and case alignment for paired AUC comparisons."""
 
 import csv
 import hashlib
@@ -27,7 +27,7 @@ class ModelInput:
     name: str
     predictions_path: Path
     metrics_path: Optional[Path]
-    epoch: int
+    epoch: Optional[int]
     epoch_selection: str = "manual_override"
     metrics_sha256_at_selection: Optional[str] = None
 
@@ -121,8 +121,11 @@ def resolve_model_inputs(
     model_values: Sequence[str],
     metrics_values: Sequence[str],
     epoch_values: Sequence[str],
+    analysis_set: str = "validation",
 ) -> List[ModelInput]:
     """Resolve paths and epochs while preserving command-line model order."""
+    if analysis_set not in {"validation", "external"}:
+        raise ValueError(f"unsupported analysis set: {analysis_set!r}")
     models = _parse_named_values(model_values, "--model")
     metrics = _parse_named_values(metrics_values, "--metrics")
     epochs = _parse_named_values(epoch_values, "--epoch")
@@ -140,24 +143,37 @@ def resolve_model_inputs(
             raise FileNotFoundError(
                 f"prediction CSV for {name} not found: {predictions_path}"
             )
-        metrics_path = (
-            Path(
-                metrics.get(name, str(predictions_path.parent / "training_metrics.csv"))
-            )
-            .expanduser()
-            .resolve()
-        )
-        if name in metrics and not metrics_path.is_file():
+        metrics_path = None
+        if name in metrics:
+            metrics_path = Path(metrics[name]).expanduser().resolve()
+        elif analysis_set == "validation":
+            metrics_path = (predictions_path.parent / "training_metrics.csv").resolve()
+        if name in metrics and metrics_path is not None and not metrics_path.is_file():
             raise FileNotFoundError(
                 f"explicit training metrics for {name} not found: {metrics_path}"
             )
 
         if name in epochs:
             epoch = _parse_integer(epochs[name], name)
-            optional_metrics_path = metrics_path if metrics_path.is_file() else None
+            optional_metrics_path = (
+                metrics_path
+                if metrics_path is not None and metrics_path.is_file()
+                else None
+            )
             epoch_selection = "manual_override"
             metrics_sha256_at_selection = None
+        elif analysis_set == "external":
+            epoch = None
+            optional_metrics_path = (
+                metrics_path
+                if metrics_path is not None and metrics_path.is_file()
+                else None
+            )
+            epoch_selection = "external_fixed_checkpoint"
+            metrics_sha256_at_selection = None
         else:
+            if metrics_path is None:
+                raise ValueError(f"training metrics are required for {name}")
             epoch, metrics_sha256_at_selection = _select_best_epoch_snapshot(
                 metrics_path
             )
@@ -178,7 +194,7 @@ def resolve_model_inputs(
 
 def load_prediction_partition(
     path: Path,
-    epoch: int,
+    epoch: Optional[int],
     stage: str,
 ) -> Dict[str, CasePrediction]:
     """Load one epoch/stage partition and enforce one valid row per case."""
@@ -192,7 +208,10 @@ def load_prediction_partition(
         for row_number, row in enumerate(reader, start=2):
             if row.get("stage", "").strip() != stage:
                 continue
-            if _parse_integer(row.get("epoch", ""), f"{path}:{row_number}") != epoch:
+            if epoch is not None and (
+                _parse_integer(row.get("epoch", ""), f"{path}:{row_number}")
+                != epoch
+            ):
                 continue
             case_id = row.get("case_id", "").strip()
             if not case_id:
@@ -217,7 +236,10 @@ def load_prediction_partition(
                 )
             predictions[case_id] = CasePrediction(target=target, score=score)
     if not predictions:
-        raise ValueError(f"no rows found for epoch={epoch}, stage={stage!r} in {path}")
+        partition = f"stage={stage!r}"
+        if epoch is not None:
+            partition = f"epoch={epoch}, {partition}"
+        raise ValueError(f"no rows found for {partition} in {path}")
     return predictions
 
 

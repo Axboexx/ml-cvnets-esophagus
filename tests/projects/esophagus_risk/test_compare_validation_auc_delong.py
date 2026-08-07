@@ -86,6 +86,24 @@ def _write_run(
     return run_dir
 
 
+def _write_external_run(root: Path, name: str, scores: list) -> Path:
+    run_dir = root / name
+    run_dir.mkdir()
+    targets = {"p1": 1, "p2": 1, "n1": 0, "n2": 0}
+    rows = [
+        {
+            "epoch": "",
+            "stage": "evaluation",
+            "case_id": case_id,
+            "target": target,
+            "positive_probability": scores[index],
+        }
+        for index, (case_id, target) in enumerate(targets.items())
+    ]
+    _write_csv(run_dir / "external_eval_predictions.csv", PREDICTION_FIELDS, rows)
+    return run_dir
+
+
 def test_select_best_epoch_uses_last_best_row(tmp_path) -> None:
     run_dir = _write_run(tmp_path, "F1", [0.9, 0.8, 0.2, 0.1])
 
@@ -232,3 +250,35 @@ def test_cli_writes_three_pairwise_comparisons(tmp_path) -> None:
     assert metadata["implementation"]["numpy"]
     assert len(metadata["implementation"]["cli_sha256"]) == 64
     assert len(metadata["implementation"]["delong_sha256"]) == 64
+
+
+def test_cli_supports_external_predictions_with_blank_epoch(tmp_path) -> None:
+    run_dirs = {
+        "F1": _write_external_run(tmp_path, "F1", [0.9, 0.8, 0.2, 0.1]),
+        "F2a": _write_external_run(tmp_path, "F2a", [0.8, 0.7, 0.3, 0.2]),
+        "F2b": _write_external_run(tmp_path, "F2b", [0.7, 0.6, 0.5, 0.4]),
+    }
+    output_dir = tmp_path / "external_results"
+    arguments = ["--analysis-set", "external"]
+    for name, run_dir in run_dirs.items():
+        arguments.extend(
+            ["--model", f"{name}={run_dir / 'external_eval_predictions.csv'}"]
+        )
+    arguments.extend(["--output-dir", str(output_dir)])
+
+    assert main(arguments) == 0
+    metadata = json.loads(
+        (output_dir / "analysis_metadata.json").read_text(encoding="utf-8")
+    )
+    readme = (output_dir / "README.md").read_text(encoding="utf-8")
+
+    assert metadata["analysis_set"] == "external"
+    assert metadata["stage"] == "evaluation"
+    assert metadata["interpretation_boundary"].startswith("External validation")
+    assert all(model["epoch"] is None for model in metadata["models"])
+    assert all(
+        model["epoch_selection"] == "external_fixed_checkpoint"
+        for model in metadata["models"]
+    )
+    assert "# External validation AUC paired DeLong analysis" in readme
+    assert "independent generalization evidence" in readme
