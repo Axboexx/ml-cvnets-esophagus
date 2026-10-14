@@ -153,6 +153,7 @@ def write_results(
     alpha: float,
     input_hashes: Mapping[Path, str],
     analysis_set: str = "validation",
+    entrypoint_path: Optional[Path] = None,
 ) -> None:
     """Compute results in a temporary directory, then atomically publish them."""
     if alpha != 0.05:
@@ -242,7 +243,9 @@ def write_results(
         "implementation": {
             "python": sys.version,
             "numpy": np.__version__,
-            "cli_sha256": _sha256(Path(__file__).resolve()),
+            "cli_sha256": _sha256(
+                (entrypoint_path or Path(__file__)).resolve()
+            ),
             "delong_sha256": _sha256(
                 Path(__file__).resolve().parent / "statistical_tests" / "delong.py"
             ),

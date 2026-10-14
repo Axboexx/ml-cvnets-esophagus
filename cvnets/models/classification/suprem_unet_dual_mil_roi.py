@@ -319,7 +319,8 @@ class SuPreMUNetDualMILRoi(BaseAnyNNModel):
         pooled_logits = segment_logits.gather(dim=1, index=logit_indices).mean(dim=1)
         return pooled_features, pooled_logits
 
-    def forward(self, x: Tensor, *args, **kwargs) -> Tensor:
+    def extract_fusion_features(self, x: Tensor) -> Tensor:
+        """Extract the whole-ROI and segment-MIL representation."""
         batch_size, channels, _, height, width = x.shape
 
         whole_features = self.extract_features(x)
@@ -349,10 +350,13 @@ class SuPreMUNetDualMILRoi(BaseAnyNNModel):
             segment_features=segment_features,
             segment_logits=segment_logits,
         )
-        fusion_features = torch.cat(
+        return torch.cat(
             [whole_features, pooled_segment_features, pooled_segment_logits],
             dim=1,
         )
+
+    def forward(self, x: Tensor, *args, **kwargs) -> Tensor:
+        fusion_features = self.extract_fusion_features(x)
         return self.fusion_classifier(fusion_features)
 
     def dummy_input_and_label(self, batch_size: int) -> Dict:

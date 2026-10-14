@@ -55,7 +55,7 @@ optim:
 scheduler:
   name: "cosine"
   is_iteration_based: false
-  max_epochs: 120
+  max_epochs: 100
   warmup_iterations: 100
   warmup_init_lr: 1.0e-6
   cosine:
