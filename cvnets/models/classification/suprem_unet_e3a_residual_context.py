@@ -53,7 +53,7 @@ class SuPreMUNetE3aResidualContext(BaseAnyNNModel):
             getattr(
                 opts,
                 "model.classification.suprem_unet_e3a_residual_context.input_channels_per_organ",
-                2,
+                1,
             )
         )
         self.context_scale = float(
@@ -66,8 +66,8 @@ class SuPreMUNetE3aResidualContext(BaseAnyNNModel):
 
         if self.num_organs < 2:
             logger.error("E3a residual context requires esophagus plus at least one context organ.")
-        if self.input_channels_per_organ != 2:
-            logger.error("E3a residual context expects CT + mask guidance channels per organ.")
+        if self.input_channels_per_organ != 1:
+            logger.error("E3a residual context expects one masked CT channel per organ.")
         if self.context_scale < 0.0:
             logger.error("context_scale must be non-negative for E3a residual context.")
 
@@ -130,8 +130,8 @@ class SuPreMUNetE3aResidualContext(BaseAnyNNModel):
         group.add_argument(
             "--model.classification.suprem-unet-e3a-residual-context.input-channels-per-organ",
             type=int,
-            default=2,
-            help="Channels per organ crop. E3a uses CT plus mask guidance.",
+            default=1,
+            help="Channels per organ crop. E3a uses one organ-masked CT channel.",
         )
         group.add_argument(
             "--model.classification.suprem-unet-e3a-residual-context.context-scale",

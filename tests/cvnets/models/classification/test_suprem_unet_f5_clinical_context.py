@@ -20,7 +20,7 @@ class _TinyF5Harness(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.num_organs = 2
-        self.input_channels_per_organ = 2
+        self.input_channels_per_organ = 1
         self.num_clinical_features = 15
         self.image_encoder = nn.Linear(8, 512)
         self.clinical_encoder = nn.Sequential(

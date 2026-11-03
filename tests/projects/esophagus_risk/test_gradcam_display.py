@@ -30,13 +30,19 @@ def test_crop_bounds_after_depth_transpose(order: str) -> None:
         DISPLAY.locate_crop(volume, crop.copy())
 
 
-def test_full_plane_overlay_stays_inside_roi(tmp_path: Path, monkeypatch: Any) -> None:
+@pytest.mark.parametrize("outside_only", [False, True])
+def test_full_plane_overlay_stays_inside_organ_mask(
+    tmp_path: Path, monkeypatch: Any, outside_only: bool
+) -> None:
     volume = np.arange(8 * 20 * 24, dtype=np.float32).reshape(8, 20, 24)
     bounds = ((2, 5), (4, 10), (7, 15))
     crop = volume[2:5, 4:10, 7:15]
     mask = np.ones_like(crop)
     mask[1] *= 2  # Select a known native layer, full CT z=3.
+    mask[1, 1:3, 2:5] = 0  # Non-organ tissue inside the bounding box.
     cam = np.full_like(crop, 0.6)
+    if outside_only:
+        cam = np.where(mask, 0.0, cam)
     args = argparse.Namespace(slices_per_organ=1, alpha=0.55, dpi=72)
     figures = []
     monkeypatch.setattr(plt, "close", lambda fig: figures.append(fig))
@@ -56,9 +62,12 @@ def test_full_plane_overlay_stays_inside_roi(tmp_path: Path, monkeypatch: Any) -
     np.testing.assert_allclose(left.images[0].get_array(), np.rot90(volume[3] / 4000))
     alpha = np.rot90(right.images[1].get_alpha(), k=-1)
     expected = np.zeros((20, 24), dtype=np.float32)
-    expected[4:10, 7:15] = 0.55
+    if not outside_only:
+        expected[4:10, 7:15] = np.where(mask[1], 0.55, 0.0)
     np.testing.assert_allclose(alpha, expected)
     heat = np.rot90(right.images[1].get_array(), k=-1)
-    np.testing.assert_allclose(heat[4:10, 7:15], 0.6)
+    expected_heat = np.zeros((20, 24), dtype=np.float32)
+    expected_heat[4:10, 7:15] = np.where(mask[1], cam[1], 0.0)
+    np.testing.assert_allclose(heat, expected_heat)
     assert (tmp_path / "full_plane.png").is_file()
     assert (tmp_path / "full_plane.pdf").is_file()

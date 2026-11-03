@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import torch
 
 from data.datasets.classification.esophagus_risk_e3a_multi_organ_roi_3d import (
     EsophagusRiskE3aMultiOrganRoi3DDataset,
@@ -188,7 +189,7 @@ def test_fixed_height_roi_uses_tight_xy_mask_bounds() -> None:
     mask_volume = np.zeros_like(ct_volume, dtype=np.int32)
     mask_volume[5:10, 4:8, 6:11] = 15
 
-    roi = dataset._extract_roi(
+    roi, mask_roi = dataset._extract_roi(
         ct_volume=ct_volume,
         mask_volume=mask_volume,
         slice_spacing_mm=2.0,
@@ -196,7 +197,102 @@ def test_fixed_height_roi_uses_tight_xy_mask_bounds() -> None:
     )
 
     assert roi.shape == (20, 4, 5)
+    assert mask_roi.shape == roi.shape
     np.testing.assert_array_equal(roi, ct_volume[5:25, 4:8, 6:11])
+    assert mask_roi[:5].all()
+    assert not mask_roi[5:].any()
+
+
+def test_esophagus_resize_fills_ct_outside_mask_with_normalized_lower_bound() -> None:
+    dataset = object.__new__(EsophagusRiskRoi3DDataset)
+    dataset.input_depth = 2
+    dataset.input_height = 3
+    dataset.input_width = 4
+    roi = np.full((2, 3, 4), 0.75, dtype=np.float32)
+    mask_roi = np.zeros_like(roi, dtype=bool)
+    mask_roi[0, 1, 2] = True
+
+    sample = dataset._resize_roi(roi=roi, mask_roi=mask_roi)
+
+    expected = torch.full((1, 2, 3, 4), -1.0, dtype=torch.float32)
+    expected[0, 0, 1, 2] = 0.75
+    torch.testing.assert_close(sample, expected)
+
+
+def test_multi_organ_resize_returns_only_masked_ct_channel() -> None:
+    dataset = object.__new__(EsophagusRiskE3aMultiOrganRoi3DDataset)
+    dataset.input_depth = 2
+    dataset.input_height = 3
+    dataset.input_width = 4
+    ct_roi = np.full((2, 3, 4), -0.5, dtype=np.float32)
+    mask_roi = np.zeros_like(ct_roi, dtype=bool)
+    mask_roi[1, 2, 3] = True
+
+    sample = dataset._resize_ct_and_mask(ct_roi=ct_roi, mask_roi=mask_roi)
+
+    expected = torch.full((1, 2, 3, 4), -1.0, dtype=torch.float32)
+    expected[0, 1, 2, 3] = -0.5
+    torch.testing.assert_close(sample, expected)
+
+
+def test_resized_organ_inputs_are_independent_of_surrounding_ct() -> None:
+    mask_roi = np.zeros((2, 2, 2), dtype=bool)
+    mask_roi[0, 0, 0] = True
+    ct_roi = np.full((2, 2, 2), 0.25, dtype=np.float32)
+    changed_ct_roi = np.where(mask_roi, ct_roi, 1000.0).astype(np.float32)
+    expected_mask = torch.zeros((1, 4, 4, 4), dtype=torch.bool)
+    expected_mask[:, :2, :2, :2] = True
+
+    for dataset_class, resize_method in (
+        (EsophagusRiskRoi3DDataset, "_resize_roi"),
+        (EsophagusRiskE3aMultiOrganRoi3DDataset, "_resize_ct_and_mask"),
+    ):
+        dataset = object.__new__(dataset_class)
+        dataset.input_depth = dataset.input_height = dataset.input_width = 4
+        resize = getattr(dataset, resize_method)
+        sample = resize(ct_roi, mask_roi)
+        changed_sample = resize(changed_ct_roi, mask_roi)
+
+        assert sample.shape == (1, 4, 4, 4)
+        assert (sample[~expected_mask] == -1).all().item()
+        assert (sample[expected_mask] > -1).any().item()
+        assert ((sample >= -1) & (sample <= 1)).all().item()
+        torch.testing.assert_close(sample, changed_sample, rtol=0, atol=0)
+
+
+def test_missing_organ_tensor_uses_normalized_lower_bound() -> None:
+    dataset = object.__new__(EsophagusRiskE3aMultiOrganRoi3DDataset)
+    dataset.input_depth = 2
+    dataset.input_height = 3
+    dataset.input_width = 4
+
+    sample = dataset._zero_organ_tensor()
+
+    assert sample.shape == (1, 2, 3, 4)
+    assert sample.dtype == torch.float32
+    assert (sample == -1).all().item()
+
+
+def test_percentile_normalization_uses_only_organ_voxels() -> None:
+    mask_roi = np.zeros((2, 2, 2), dtype=bool)
+    mask_roi[0] = True
+    ct_roi = np.arange(8, dtype=np.float32).reshape(2, 2, 2)
+    changed_ct_roi = np.where(mask_roi, ct_roi, 1000.0).astype(np.float32)
+
+    for dataset_class in (
+        EsophagusRiskRoi3DDataset,
+        EsophagusRiskE3aMultiOrganRoi3DDataset,
+    ):
+        dataset = object.__new__(dataset_class)
+        dataset.use_windowing = False
+        dataset.clip_percentile_lower = 0.0
+        dataset.clip_percentile_upper = 100.0
+        normalized = dataset._normalize_roi(ct_roi, mask_roi)
+        changed = dataset._normalize_roi(changed_ct_roi, mask_roi)
+        np.testing.assert_array_equal(normalized[mask_roi], changed[mask_roi])
+        np.testing.assert_allclose(
+            normalized[mask_roi], [-1, -1 / 3, 1 / 3, 1], atol=1e-7
+        )
 
 
 def test_multi_organ_specs_disable_margins_for_every_organ() -> None:

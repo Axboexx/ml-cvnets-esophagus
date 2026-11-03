@@ -279,3 +279,27 @@ def _cell_value(cell: ElementTree.Element, shared_strings: Sequence[str]) -> obj
         return value == "1"
     number = float(value)
     return int(number) if number.is_integer() else number
+
+
+G4_CLINICAL_FEATURE_NAMES = (
+    "sex", "age", "hct", "hb", "plt", "pt", "inr", "ast", "alt",
+    "alb", "tb", "tp", "cr", "child_0", "child_1", "child_2", "hepatitis",
+)
+
+
+def encode_g4_clinical_features(record: ClinicalRecord) -> tuple[float, ...]:
+    """Expand the raw Child category without rounding or imputation."""
+    if len(record.features) != len(CLINICAL_FEATURE_NAMES):
+        raise ValueError(f"G4 requires 15 raw clinical values: case_id={record.case_id}")
+    child_index = CLINICAL_FEATURE_NAMES.index("child")
+    child = record.features[child_index]
+    if child not in (0.0, 1.0, 2.0):
+        raise ValueError(
+            f"Invalid G4 child={child!r}; expected 0, 1, or 2: "
+            f"case_id={record.case_id}"
+        )
+    return (
+        *record.features[:child_index],
+        *(float(child == category) for category in (0, 1, 2)),
+        *record.features[child_index + 1:],
+    )

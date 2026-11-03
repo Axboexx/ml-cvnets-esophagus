@@ -8,6 +8,7 @@ import glob
 import math
 import os
 import re
+import shutil
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -165,18 +166,21 @@ def save_top_k_auc_checkpoints(
     save_dir: str,
     k_best_checkpoints: int,
 ) -> None:
-    """Save model weights for the globally highest validation AUC values.
+    """Save model weights whenever validation AUC sets a new best record.
 
-    This checkpoint family is independent from the primary checkpoint metric.
-    It stores model weights only and intentionally does not create an averaged
-    model or a second training-resume checkpoint.
+    Mirrors the accuracy ``checkpoint_best`` logic: only an epoch whose AUC is
+    strictly higher than every retained AUC checkpoint is saved, so ties keep
+    the earliest epoch. The latest ``k_best_checkpoints`` records are retained
+    as ``checkpoint_auc_epoch_XXXX_score_X.pt`` and the top record is copied to
+    ``checkpoint_auc_best.pt``. The record is read from the saved files, so it
+    survives resumed training. Weights only; no averaged or resume checkpoint.
 
     Args:
         model_state: ``state_dict`` containing model parameters.
         auc: Case-level validation AUC for the current epoch.
         epoch: Current training epoch.
         save_dir: Directory in which checkpoints are stored.
-        k_best_checkpoints: Maximum number of AUC-ranked checkpoints to retain.
+        k_best_checkpoints: Maximum number of AUC record checkpoints to retain.
     """
     if k_best_checkpoints <= 0:
         return
@@ -188,25 +192,13 @@ def save_top_k_auc_checkpoints(
         )
         return
 
+    # Compare at file-name precision so the record test matches what is saved.
+    score = float("{:.8f}".format(auc))
     checkpoint_pattern = os.path.join(
         save_dir, "checkpoint_auc_epoch_*_score_*.{}".format(CHECKPOINT_EXTN)
     )
-    current_epoch_pattern = os.path.join(
-        save_dir,
-        "checkpoint_auc_epoch_{:04d}_score_*.{}".format(epoch, CHECKPOINT_EXTN),
-    )
-    checkpoint_path = os.path.join(
-        save_dir,
-        "checkpoint_auc_epoch_{:04d}_score_{:.8f}.{}".format(
-            epoch, auc, CHECKPOINT_EXTN
-        ),
-    )
-    torch.save(model_state, checkpoint_path)
-    for previous_checkpoint_path in glob.glob(current_epoch_pattern):
-        if previous_checkpoint_path != checkpoint_path:
-            os.remove(previous_checkpoint_path)
-
     ranked_checkpoints = []
+    removed_stale_epoch = False
     for candidate_path in glob.glob(checkpoint_pattern):
         match = _AUC_CHECKPOINT_PATTERN.match(os.path.basename(candidate_path))
         if match is None:
@@ -214,8 +206,31 @@ def save_top_k_auc_checkpoints(
                 "Ignoring unrecognized AUC checkpoint name: {}".format(candidate_path)
             )
             continue
+        candidate_epoch = int(match.group(1))
+        if candidate_epoch == epoch:
+            # A re-run epoch replaces its stale weights.
+            os.remove(candidate_path)
+            removed_stale_epoch = True
+            continue
         ranked_checkpoints.append(
-            (float(match.group(2)), int(match.group(1)), candidate_path)
+            (float(match.group(2)), candidate_epoch, candidate_path)
+        )
+
+    best_score = max((item[0] for item in ranked_checkpoints), default=-math.inf)
+    is_new_record = score > best_score
+    if is_new_record:
+        checkpoint_path = os.path.join(
+            save_dir,
+            "checkpoint_auc_epoch_{:04d}_score_{:.8f}.{}".format(
+                epoch, score, CHECKPOINT_EXTN
+            ),
+        )
+        torch.save(model_state, checkpoint_path)
+        ranked_checkpoints.append((score, epoch, checkpoint_path))
+        logger.log(
+            "Best validation AUC checkpoint with score {:.8f} saved at {}".format(
+                score, checkpoint_path
+            )
         )
 
     ranked_checkpoints.sort(key=lambda item: (-item[0], item[1], item[2]))
@@ -223,12 +238,12 @@ def save_top_k_auc_checkpoints(
         os.remove(checkpoint_to_remove)
         logger.log("Deleting AUC checkpoint: {}".format(checkpoint_to_remove))
 
-    if os.path.isfile(checkpoint_path):
-        logger.log(
-            "Validation AUC checkpoint with score {:.8f} saved at {}".format(
-                auc, checkpoint_path
-            )
-        )
+    best_path = os.path.join(save_dir, "checkpoint_auc_best.{}".format(CHECKPOINT_EXTN))
+    if ranked_checkpoints:
+        if is_new_record or removed_stale_epoch or not os.path.isfile(best_path):
+            shutil.copyfile(ranked_checkpoints[0][2], best_path)
+    elif os.path.isfile(best_path):
+        os.remove(best_path)
 
 
 def save_interval_checkpoint(

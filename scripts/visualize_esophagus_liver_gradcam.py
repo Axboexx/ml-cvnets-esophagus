@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Export full axial CT with spatially restored esophagus/liver ROI Grad-CAM."""
+"""Export full axial CT with spatially restored multi-organ ROI Grad-CAM.
+
+Supports esophagus + liver and esophagus + liver + spleen residual-context
+models.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +23,7 @@ if str(ROOT) not in sys.path:
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_CASES = ("08887988", "08577671", "13646226", "02377541", "12123738")
+SUPPORTED_ORGANS = (("esophagus", "liver"), ("esophagus", "liver", "spleen"))
 
 
 def parse_args() -> argparse.Namespace:
@@ -142,10 +147,14 @@ def build_dataset(opts: argparse.Namespace, case_ids: List[str]) -> Any:
                 )
             return selected
 
-        def _normalize_roi(self, roi: np.ndarray) -> np.ndarray:
+        def _normalize_roi(
+            self,
+            roi: np.ndarray,
+            mask_roi: np.ndarray,
+        ) -> np.ndarray:
             self.native_bounds.append(locate_crop(self.full_ct, roi))
             self.current_native_ct = roi.copy()
-            return super()._normalize_roi(roi)
+            return super()._normalize_roi(roi, mask_roi)
 
         def _resize_ct_and_mask(self, ct_roi: np.ndarray, mask_roi: np.ndarray) -> Any:
             self.native_crops.append(
@@ -154,17 +163,21 @@ def build_dataset(opts: argparse.Namespace, case_ids: List[str]) -> Any:
             return super()._resize_ct_and_mask(ct_roi, mask_roi)
 
     dataset = CaptureDataset(opts, is_training=False, is_evaluation=True)
-    if [s.name for s in dataset.organ_specs] != ["esophagus", "liver"]:
+    organs = tuple(s.name for s in dataset.organ_specs)
+    if organs not in SUPPORTED_ORGANS:
         raise ValueError(
-            "Training configuration must specify esophagus,liver in that order."
+            "Training configuration must specify esophagus,liver or "
+            f"esophagus,liver,spleen in that order; got {','.join(organs)}."
         )
-    if {s.name for s in dataset.organ_specs if s.required} != {"esophagus", "liver"}:
+    if {s.name for s in dataset.organ_specs if s.required} != set(organs):
         # A missing optional organ is allowed in training, but cannot be visualized.
-        LOGGER.info("Both requested organ masks must be present for visualization.")
+        LOGGER.info("Every requested organ mask must be present for visualization.")
     return dataset
 
 
-def load_model(opts: argparse.Namespace, checkpoint: Path, device: str) -> Any:
+def load_model(
+    opts: argparse.Namespace, checkpoint: Path, device: str, num_organs: int
+) -> Any:
     import torch
     from cvnets.models.classification.suprem_unet_e3a_residual_context import (
         SuPreMUNetE3aResidualContext,
@@ -172,14 +185,16 @@ def load_model(opts: argparse.Namespace, checkpoint: Path, device: str) -> Any:
 
     if getattr(opts, "model.classification.name") != "suprem_unet_e3a_residual_context":
         raise ValueError(
-            "This script supports the F3 esophagus/liver residual-context model."
+            "This script supports the esophagus residual-context model."
         )
     prefix = "model.classification.suprem_unet_e3a_residual_context"
     setattr(opts, f"{prefix}.pretrained_path", "")
     setattr(opts, f"{prefix}.require_pretrained", False)
     model = SuPreMUNetE3aResidualContext(opts)
-    if model.num_organs != 2:
-        raise ValueError("The selected model must use exactly two organs.")
+    if model.num_organs != num_organs:
+        raise ValueError(
+            f"Model uses {model.num_organs} organs but the dataset has {num_organs}."
+        )
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     state = payload.get("model_state_dict", payload.get("state_dict", payload))
     state = {key.removeprefix("module."): value for key, value in state.items()}
@@ -188,6 +203,7 @@ def load_model(opts: argparse.Namespace, checkpoint: Path, device: str) -> Any:
 
 
 def export_figure(
+    organ_names: List[str],
     crops: List[Tuple[Any, Any, Any]],
     cams: List[Any],
     spacing: Tuple[float, ...],
@@ -206,13 +222,14 @@ def export_figure(
     from projects.esophagus_risk.gradcam import select_slices
 
     fig, axes = plt.subplots(
-        2,
+        len(organ_names),
         args.slices_per_organ * 2,
         squeeze=False,
-        figsize=(args.slices_per_organ * 5.0, 6.4),
+        figsize=(args.slices_per_organ * 5.0, 3.2 * len(organ_names)),
     )
     selection: Dict[str, Any] = {}
-    for row, (name, crop, cam) in enumerate(zip(("Esophagus", "Liver"), crops, cams)):
+    titles = [organ.capitalize() for organ in organ_names]
+    for row, (name, crop, cam) in enumerate(zip(titles, crops, cams)):
         _, mask, _ = crop
         (z_start, _), (x_start, x_end), (y_start, y_end) = bounds[row]
         slices = select_slices(mask, args.slices_per_organ)
@@ -220,17 +237,25 @@ def export_figure(
         for axis in axes[row]:
             axis.set_axis_off()
         for column, index in enumerate(slices):
-            # NIfTI [X,Y,Z] -> dataset [Z,X,Y] -> display [Y,X].
+            # NIfTI [X,Y,Z] -> dataset [Z,X,Y] -> display [Y,X], then flipped
+            # vertically (flipud) so anatomy is upright.
             full_index = z_start + index
             lower, upper = display_window
-            ct_slice = np.rot90(
-                np.clip((full_ct[full_index] - lower) / (upper - lower), 0, 1)
+            ct_slice = np.flipud(
+                np.rot90(
+                    np.clip((full_ct[full_index] - lower) / (upper - lower), 0, 1)
+                )
             )
             heat = np.zeros(full_ct.shape[1:], dtype=np.float32)
             opacity = np.zeros_like(heat)
-            heat[x_start:x_end, y_start:y_end] = cam[index]
-            if np.max(cam) > 0:
-                opacity[x_start:x_end, y_start:y_end] = args.alpha
+            organ_slice = mask[index].astype(bool)
+            heat[x_start:x_end, y_start:y_end] = np.where(
+                organ_slice, cam[index], 0.0
+            )
+            if np.max(np.where(mask, cam, 0.0)) > 0:
+                opacity[x_start:x_end, y_start:y_end] = np.where(
+                    organ_slice, args.alpha, 0.0
+                )
             left, right = axes[row, column * 2 : column * 2 + 2]
             for axis in (left, right):
                 axis.imshow(
@@ -242,13 +267,13 @@ def export_figure(
                     interpolation="nearest",
                 )
             right.imshow(
-                np.rot90(heat),
+                np.flipud(np.rot90(heat)),
                 cmap="jet",
                 vmin=0,
                 vmax=1,
                 aspect=spacing[1] / spacing[0],
-                alpha=np.rot90(opacity),
-                interpolation="bilinear",
+                alpha=np.flipud(np.rot90(opacity)),
+                interpolation="nearest",
             )
             left.set_title(f"{name} | CT | z={full_index}", fontsize=9)
             right.set_title("ROI Grad-CAM on full CT", fontsize=9)
@@ -302,7 +327,8 @@ def main() -> None:
     )
     setattr(opts, "dataset.root_test", str(args.data_root))
     dataset = build_dataset(opts, args.case_ids)
-    model = load_model(opts, args.checkpoint, args.device)
+    organ_names = [spec.name for spec in dataset.organ_specs]
+    model = load_model(opts, args.checkpoint, args.device, len(organ_names))
     layer = model.get_submodule(args.target_layer)
     args.output_dir.mkdir(parents=True, exist_ok=False)
     metadata = {
@@ -330,7 +356,7 @@ def main() -> None:
         "slice_rule": "largest organ-mask area with spacing; independent of CAM and prediction",
         "normalization": "ReLU, per-organ 3D maximum; no cross-organ/case magnitude comparison",
         "orientation": "full native voxel axial planes, no anatomical L/R claims",
-        "display": "full CT; CAM restored only inside the exact model ROI; outside ROI uncolored",
+        "display": "full CT; CAM restored only inside the organ mask",
         "cases": [],
     }
     manifest = args.output_dir / "metadata.json"
@@ -346,8 +372,8 @@ def main() -> None:
         dataset.native_crops = []
         dataset.native_bounds = []
         sample = dataset[index]
-        if len(dataset.native_crops) != 2:
-            raise ValueError(f"Both organ crops must be present: {record.case_id}")
+        if len(dataset.native_crops) != len(organ_names):
+            raise ValueError(f"Every organ crop must be present: {record.case_id}")
         cams, logits = compute_gradcam(
             model,
             sample["samples"].unsqueeze(0).to(args.device),
@@ -375,6 +401,7 @@ def main() -> None:
             ).tolist()
         display_window = (float(lower), float(max(upper, lower + 1)))
         slices = export_figure(
+            organ_names,
             dataset.native_crops,
             native_cams,
             spacing,
@@ -384,13 +411,11 @@ def main() -> None:
             dataset.native_bounds,
             display_window,
         )
-        np.savez_compressed(
-            stem.with_suffix(".npz"),
-            esophagus_cam=native_cams[0],
-            liver_cam=native_cams[1],
-            esophagus_ct=dataset.native_crops[0][0],
-            liver_ct=dataset.native_crops[1][0],
-        )
+        arrays = {}
+        for name, cam, crop in zip(organ_names, native_cams, dataset.native_crops):
+            arrays[f"{name}_cam"] = cam
+            arrays[f"{name}_ct"] = crop[0]
+        np.savez_compressed(stem.with_suffix(".npz"), **arrays)
         metadata["cases"].append(
             {
                 "figure": stem.name,

@@ -166,7 +166,8 @@ def arguments_common(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
         type=int,
         default=5,
         help=(
-            "Keep model weights for the top-k validation AUC values without "
+            "Keep model weights for the latest k new-best validation AUC records "
+            "(strictly higher AUC; ties keep the earliest epoch) without "
             "creating an averaged or resume checkpoint"
         ),
     )

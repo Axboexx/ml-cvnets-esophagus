@@ -49,7 +49,7 @@ class SuPreMUNetE3aConcat(BaseAnyNNModel):
             getattr(
                 opts,
                 "model.classification.suprem_unet_e3a_concat.input_channels_per_organ",
-                2,
+                1,
             )
         )
         fusion_hidden_dim = int(
@@ -58,8 +58,8 @@ class SuPreMUNetE3aConcat(BaseAnyNNModel):
 
         if self.num_organs < 1:
             logger.error("num_organs must be >= 1 for E3a concat.")
-        if self.input_channels_per_organ != 2:
-            logger.error("E3a concat expects CT + mask guidance channels per organ.")
+        if self.input_channels_per_organ != 1:
+            logger.error("E3a concat expects one masked CT channel per organ.")
 
         self.input_adapter = nn.Conv3d(
             in_channels=self.input_channels_per_organ,
@@ -127,8 +127,8 @@ class SuPreMUNetE3aConcat(BaseAnyNNModel):
         group.add_argument(
             "--model.classification.suprem-unet-e3a-concat.input-channels-per-organ",
             type=int,
-            default=2,
-            help="Channels per organ crop. E3a uses CT plus mask guidance.",
+            default=1,
+            help="Channels per organ crop. E3a uses one organ-masked CT channel.",
         )
         group.add_argument(
             "--model.classification.suprem-unet-e3a-concat.fusion-hidden-dim",

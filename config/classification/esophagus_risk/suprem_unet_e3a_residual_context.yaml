@@ -71,7 +71,7 @@ model:
       pretrained_path: ""
       require_pretrained: true
       num_organs: 4
-      input_channels_per_organ: 2
+      input_channels_per_organ: 1
       context_scale: 1.0
     activation:
       name: "relu"

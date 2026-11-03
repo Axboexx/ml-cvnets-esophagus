@@ -1,4 +1,6 @@
-# 食管＋肝脏 F3 Grad-CAM
+# 食管＋肝脏（＋脾脏）Grad-CAM
+
+支持 `esophagus,liver` 和 `esophagus,liver,spleen` 两种 residual-context 模型，器官顺序必须与训练一致；三器官时把下例 overrides 改为 `esophagus,liver,spleen` / `15,5,1` / `0,0,0`、`num_organs=3`。图中每个器官一行，NPZ 键名为 `<organ>_cam`、`<organ>_ct`。
 
 入口：`scripts/visualize_esophagus_liver_gradcam.py`。默认处理
 `08887988 08577671 13646226 02377541 12123738`，保留前导零。
@@ -59,10 +61,11 @@ youyi/
   CT 不做模型输入尺寸的拉伸，CAM 上采样回原始 ROI 网格后按实际裁剪坐标回填。
   ROI 外不着色，不能将 ROI 模型的 CAM 解释为全截面注意力。
   保留原始像素纵横比；图上 z 是原始 CT 体积内的零起始层索引。
-  使用 native voxel 轴位，未进行标准解剖重定向，不标注 L/R。
+  使用 native voxel 轴位，显示时在原方向基础上上下翻转（CT 与热力图同步），
+  未进行标准解剖重定向，不标注 L/R。
 - `case_01.png/.pdf` 等：600 dpi PNG 和 PDF，编号按输入顺序。
   图中不显示医院病例编号。图像内部的 CT 和热力图均为栅格。
-- `case_01.npz` 等：两个器官的原始 ROI CT（HU）与归一化 3D CAM。
+- `case_01.npz` 等：各器官的原始 ROI CT（HU）与归一化 3D CAM。
 - `metadata.json`：病例映射、真实标签、当前前向 HR 概率、切片索引、
   spacing、ROI 裁剪坐标、ROI 内及完整 CT 切片索引、显示 HU 范围、原始 CAM
   最大值、空 CAM 标记、配置/权重 SHA256、解析后的参数。

@@ -73,7 +73,7 @@ model:
       pretrained_path: ""
       require_pretrained: true
       num_organs: 2
-      input_channels_per_organ: 2
+      input_channels_per_organ: 1
       context_scale: 1.0
     suprem_unet_f5_clinical_context:
       num_clinical_features: 15

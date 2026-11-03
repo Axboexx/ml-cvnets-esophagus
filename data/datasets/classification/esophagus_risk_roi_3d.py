@@ -34,6 +34,8 @@ _NEGATIVE_LABEL_NAMES = {
 _POSITIVE_LABEL_NAMES = {"hr"}
 _MASK_KEYWORDS = ("mask", "seg", "label")
 _NIFTI_SUFFIXES = (".nii", ".nii.gz")
+# Lower bound of normalized CT; shared by single- and multi-organ datasets.
+_OUTSIDE_MASK_VALUE = -1.0
 
 
 @dataclass(frozen=True)
@@ -396,7 +398,7 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
         mask_volume: np.ndarray,
         slice_spacing_mm: float,
         slice_axis_direction: int,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
         esophagus_mask = mask_volume == self.label_id
         coords = np.argwhere(esophagus_mask)
         if coords.size == 0:
@@ -437,15 +439,27 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
                 ct_volume.shape[2],
                 self.roi_margin_xy,
             )
-        return ct_volume[d_start:d_end, h_start:h_end, w_start:w_end]
+        return (
+            ct_volume[d_start:d_end, h_start:h_end, w_start:w_end],
+            esophagus_mask[d_start:d_end, h_start:h_end, w_start:w_end],
+        )
 
-    def _normalize_roi(self, roi: np.ndarray) -> np.ndarray:
+    def _normalize_roi(
+        self,
+        roi: np.ndarray,
+        mask_roi: np.ndarray,
+    ) -> np.ndarray:
         if self.use_windowing:
             lower = self.window_center - self.window_width / 2.0
             upper = self.window_center + self.window_width / 2.0
         else:
-            lower = float(np.percentile(roi, self.clip_percentile_lower))
-            upper = float(np.percentile(roi, self.clip_percentile_upper))
+            organ_voxels = roi[mask_roi]
+            lower = float(
+                np.percentile(organ_voxels, self.clip_percentile_lower)
+            )
+            upper = float(
+                np.percentile(organ_voxels, self.clip_percentile_upper)
+            )
 
         if upper <= lower:
             upper = lower + 1.0
@@ -455,15 +469,35 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
         roi = (roi * 2.0) - 1.0
         return roi.astype(np.float32, copy=False)
 
-    def _resize_roi(self, roi: np.ndarray) -> torch.Tensor:
-        roi_tensor = torch.from_numpy(roi).unsqueeze(0).unsqueeze(0)
+    def _resize_roi(
+        self,
+        roi: np.ndarray,
+        mask_roi: np.ndarray,
+    ) -> torch.Tensor:
+        masked_roi = np.where(mask_roi, roi, _OUTSIDE_MASK_VALUE).astype(
+            np.float32, copy=False
+        )
+        roi_tensor = torch.from_numpy(masked_roi).unsqueeze(0).unsqueeze(0)
         roi_tensor = F.interpolate(
             roi_tensor,
             size=(self.input_depth, self.input_height, self.input_width),
             mode="trilinear",
             align_corners=False,
         )
-        return roi_tensor.squeeze(0)
+
+        mask_tensor = torch.from_numpy(
+            mask_roi.astype(np.float32, copy=False)
+        ).unsqueeze(0).unsqueeze(0)
+        mask_tensor = F.interpolate(
+            mask_tensor,
+            size=(self.input_depth, self.input_height, self.input_width),
+            mode="nearest",
+        )
+        return torch.where(
+            mask_tensor > 0,
+            roi_tensor,
+            torch.full_like(roi_tensor, _OUTSIDE_MASK_VALUE),
+        ).squeeze(0)
 
     def __getitem__(self, sample_size_and_index: Any) -> Dict[str, Any]:
         sample_index = self._parse_index(sample_size_and_index)
@@ -475,14 +509,14 @@ class EsophagusRiskRoi3DDataset(BaseDataset):
         ct_volume = _to_depth_first(ct_nifti.data.astype(np.float32, copy=False))
         mask_volume = _to_depth_first(mask_nifti.data.astype(np.int32, copy=False))
 
-        roi = self._extract_roi(
+        roi, mask_roi = self._extract_roi(
             ct_volume=ct_volume,
             mask_volume=mask_volume,
             slice_spacing_mm=ct_nifti.spacing[2],
             slice_axis_direction=ct_nifti.slice_axis_direction,
         )
-        roi = self._normalize_roi(roi=roi)
-        sample_tensor = self._resize_roi(roi=roi)
+        roi = self._normalize_roi(roi=roi, mask_roi=mask_roi)
+        sample_tensor = self._resize_roi(roi=roi, mask_roi=mask_roi)
 
         return {
             "samples": sample_tensor,

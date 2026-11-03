@@ -2,6 +2,42 @@
 
 This directory contains the esophagus-risk classification experiments on top of `ml-cvnets`.
 
+## G-series organ-masked CT protocol (2026-10-14)
+
+New G-series runs retain only the corresponding organ's CT inside each tight
+bounding box. Masking happens **after CT normalization**: outside-mask voxels
+are filled with **-1**, both before CT trilinear resizing and after resizing
+with the nearest-neighbor mask. With center 50 HU and width 350 HU, the window
+[-125, 225] maps to [-1, 1]; normalized 0 corresponds to 50 HU and is not the
+background value. Missing optional organs also use a tensor filled with -1. The
+percentile fallback estimates bounds from organ voxels only. Esophageal lumen
+gas can also reach -1; this overlap with background is accepted.
+
+Each organ has **one CT input channel**. The multi-organ models (including
+three-organ combinations and the F3/F5-derived G architectures) previously
+used CT + mask; their separate mask channel is removed. Mask files remain
+required for filtering, cropping and masking. Existing split, height, crop,
+margin and segment rules remain unchanged. Grad-CAM overlays color only the
+native organ mask, even when full CT is displayed.
+
+Validation-AUC checkpoints follow the accuracy `checkpoint_best` pattern: an
+epoch is saved only when its AUC (8 decimals) is strictly higher than every
+earlier record, so ties keep the earliest epoch. The latest
+`common.k_best_auc_checkpoints` records (default 5) are kept as
+`checkpoint_auc_epoch_XXXX_score_X.pt`, and the current record is copied to
+`checkpoint_auc_best.pt`, which is the G model for external evaluation. No
+averaged AUC checkpoint is created.
+
+All G models must be retrained. F-series checkpoints, locked Youden thresholds
+and Grad-CAM results do not apply to G. **Use a fresh results directory and a
+new G run label**; do not reuse F-series run locations. Most esophagus-risk
+YAMLs, including F5, enable `common.auto_resume`, so reusing a run directory can
+load an F checkpoint silently for unchanged single-channel architectures.
+Auto-resume may be used only to continue the same G run. The older F-series
+commands below document historical run names; change both paths and labels
+before launching G training. Old two-channel full-model checkpoints are also
+incompatible with the new multi-organ input adapter.
+
 ## Recommended path: native 3D ml-cvnets integration
 
 The current recommended experiment is a native `ml-cvnets` classification pipeline:
@@ -221,8 +257,9 @@ clinical encoder used by F4. The shared SuPreM image branch produces a 512-D
 representation (`esophagus + projected liver residual`); the clinical branch
 produces 16 dimensions, and the binary classifier receives their 528-D
 concatenation. Both esophagus and liver are required. The experiment starts
-from the SuPreM backbone rather than an F3 checkpoint, and auto-resume is
-disabled in the F5 config.
+from the SuPreM backbone rather than an F3 checkpoint. Auto-resume is enabled
+in the F5 config; use a fresh run directory for a new experiment so that no
+existing full-model checkpoint overrides this initialization.
 
 Tongji training from the server `ml-cvnets` root:
 
@@ -242,6 +279,111 @@ python3 -c 'from main_train import main_worker; main_worker()' \
 
 Do not add `model.classification.pretrained` to this training command: that
 option loads a complete prior model and would no longer be a SuPreM-only start.
+
+
+### G4 clinical fusion
+
+G4 adds laboratory/clinical late fusion to the G3 whole-ROI residual-context
+model, not the G2b dual-MIL model. Supported ordered organs are E+L (15,5)
+and E+L+S (15,5,1). Only esophagus is required by default, exactly as in G3;
+missing optional organs retain the inherited CT tensor filled with -1. All image
+preprocessing is inherited unchanged (one masked CT channel, mask outside
+filled with -1 after normalization, zero margins, minimum 40 mm esophagus,
+inferior-to-superior 40 mm crop).
+
+The 17 clinical features, in order, are:
+`sex, age, hct, hb, plt, pt, inr, ast, alt, alb, tb, tp, cr,
+child_0, child_1, child_2, hepatitis`.
+Raw child must be exactly 0, 1, or 2 and is expanded into one-hot values;
+fractional or other values fail at startup with the case ID, without rounding.
+All height-eligible cases, including both internal splits, are matched to
+clinical records at startup. Workbook labels are used only for consistency
+checks, not as predictors.
+F4/F5 retain their original 15-feature contract.
+
+The image representation is 512-D; the default clinical MLP produces 16-D;
+their concatenation feeds a 528-to-2 classifier. Only the SuPreM encoder is
+loaded for initialization. Auto-resume is enabled: training must use a fresh
+results directory/run label. External evaluation must also use a new output
+directory and the corresponding training run's `checkpoint_auc_best.pt`.
+Do not select checkpoints using Youyi results.
+
+#### G4 E+L training
+
+```bash
+python3 -c 'from main_train import main_worker; main_worker()' \
+  --common.config-file config/classification/esophagus_risk/suprem_unet_g4_clinical_context.yaml \
+  --common.results-loc /home/mw/work/results/G4_esophagus_liver \
+  --common.run-label g4_esophagus_liver_clinical_seed42 \
+  --common.seed 42 \
+  --common.override-kwargs \
+    dataset.root_train=/home/mw/work/dataset/egc_dataset \
+    dataset.root_val="" \
+    dataset.root_test="" \
+    dataset.esophagus_g4.clinical_workbook=/home/mw/work/dataset/同济临床填补指标-4cm.xlsx \
+    model.classification.suprem_unet_e3a_residual_context.pretrained_path=/home/mw/work/SuPreM/supervised_suprem_unet_2100.pth
+```
+
+#### G4 E+L Youyi external evaluation
+
+```bash
+python3 -c 'from main_eval import main_worker; main_worker()' \
+  --common.config-file config/classification/esophagus_risk/suprem_unet_g4_clinical_context.yaml \
+  --common.results-loc /home/mw/work/results/G4_esophagus_liver_external_new \
+  --common.run-label g4_esophagus_liver_youyi_auc_best \
+  --common.eval-stage-name youyi_external \
+  --common.seed 42 \
+  --common.override-kwargs \
+    dataset.name=esophagus_risk_youyi_g4_clinical_roi_3d \
+    dataset.root_test=/home/mw/work/dataset/youyi \
+    dataset.esophagus_g4.clinical_workbook=/home/mw/work/dataset/友谊临床指标填补-4cm.xlsx \
+    model.classification.suprem_unet_e3a_residual_context.require_pretrained=false \
+    model.classification.pretrained=/home/mw/work/results/G4_esophagus_liver/g4_esophagus_liver_clinical_seed42/checkpoint_auc_best.pt
+```
+
+#### G4 E+L+S training
+
+```bash
+python3 -c 'from main_train import main_worker; main_worker()' \
+  --common.config-file config/classification/esophagus_risk/suprem_unet_g4_clinical_context.yaml \
+  --common.results-loc /home/mw/work/results/G4_esophagus_liver_spleen \
+  --common.run-label g4_esophagus_liver_spleen_clinical_seed42 \
+  --common.seed 42 \
+  --common.override-kwargs \
+    dataset.root_train=/home/mw/work/dataset/egc_dataset \
+    dataset.root_val="" \
+    dataset.root_test="" \
+    dataset.esophagus_g4.clinical_workbook=/home/mw/work/dataset/同济临床填补指标-4cm.xlsx \
+    dataset.e3a_multi_organ_roi_3d.organ_names=esophagus,liver,spleen \
+    dataset.e3a_multi_organ_roi_3d.label_ids=15,5,1 \
+    dataset.e3a_multi_organ_roi_3d.roi_margin_xy=0,0,0 \
+    dataset.e3a_multi_organ_roi_3d.roi_margin_z=0,0,0 \
+    model.classification.suprem_unet_e3a_residual_context.num_organs=3 \
+    model.classification.suprem_unet_e3a_residual_context.pretrained_path=/home/mw/work/SuPreM/supervised_suprem_unet_2100.pth
+```
+
+#### G4 E+L+S Youyi external evaluation
+
+```bash
+python3 -c 'from main_eval import main_worker; main_worker()' \
+  --common.config-file config/classification/esophagus_risk/suprem_unet_g4_clinical_context.yaml \
+  --common.results-loc /home/mw/work/results/G4_esophagus_liver_spleen_external_new \
+  --common.run-label g4_esophagus_liver_spleen_youyi_auc_best \
+  --common.eval-stage-name youyi_external \
+  --common.seed 42 \
+  --common.override-kwargs \
+    dataset.name=esophagus_risk_youyi_g4_clinical_roi_3d \
+    dataset.root_test=/home/mw/work/dataset/youyi \
+    dataset.esophagus_g4.clinical_workbook=/home/mw/work/dataset/友谊临床指标填补-4cm.xlsx \
+    dataset.e3a_multi_organ_roi_3d.organ_names=esophagus,liver,spleen \
+    dataset.e3a_multi_organ_roi_3d.label_ids=15,5,1 \
+    dataset.e3a_multi_organ_roi_3d.roi_margin_xy=0,0,0 \
+    dataset.e3a_multi_organ_roi_3d.roi_margin_z=0,0,0 \
+    model.classification.suprem_unet_e3a_residual_context.num_organs=3 \
+    model.classification.suprem_unet_e3a_residual_context.require_pretrained=false \
+    model.classification.pretrained=/home/mw/work/results/G4_esophagus_liver_spleen/g4_esophagus_liver_spleen_clinical_seed42/checkpoint_auc_best.pt
+```
+
 
 ### Saved training metrics
 

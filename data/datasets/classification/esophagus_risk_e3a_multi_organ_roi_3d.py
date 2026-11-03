@@ -16,6 +16,7 @@ from torch.nn import functional as F
 
 from data.datasets import DATASET_REGISTRY
 from data.datasets.classification.esophagus_risk_roi_3d import (
+    _OUTSIDE_MASK_VALUE,
     CaseRecord,
     _discover_records,
     _expand_bounds,
@@ -340,13 +341,22 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
             return int(sample_size_and_index[-1])
         return int(sample_size_and_index)
 
-    def _normalize_roi(self, roi: np.ndarray) -> np.ndarray:
+    def _normalize_roi(
+        self,
+        roi: np.ndarray,
+        mask_roi: np.ndarray,
+    ) -> np.ndarray:
         if self.use_windowing:
             lower = self.window_center - self.window_width / 2.0
             upper = self.window_center + self.window_width / 2.0
         else:
-            lower = float(np.percentile(roi, self.clip_percentile_lower))
-            upper = float(np.percentile(roi, self.clip_percentile_upper))
+            organ_voxels = roi[mask_roi]
+            lower = float(
+                np.percentile(organ_voxels, self.clip_percentile_lower)
+            )
+            upper = float(
+                np.percentile(organ_voxels, self.clip_percentile_upper)
+            )
 
         if upper <= lower:
             upper = lower + 1.0
@@ -356,8 +366,16 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
         roi = (roi * 2.0) - 1.0
         return roi.astype(np.float32, copy=False)
 
-    def _resize_ct_and_mask(self, ct_roi: np.ndarray, mask_roi: np.ndarray) -> torch.Tensor:
-        ct_tensor = torch.from_numpy(ct_roi).unsqueeze(0).unsqueeze(0)
+    def _resize_ct_and_mask(
+        self,
+        ct_roi: np.ndarray,
+        mask_roi: np.ndarray,
+    ) -> torch.Tensor:
+        masked_ct_roi = np.where(mask_roi, ct_roi, _OUTSIDE_MASK_VALUE).astype(
+            np.float32,
+            copy=False,
+        )
+        ct_tensor = torch.from_numpy(masked_ct_roi).unsqueeze(0).unsqueeze(0)
         ct_tensor = F.interpolate(
             ct_tensor,
             size=(self.input_depth, self.input_height, self.input_width),
@@ -373,14 +391,16 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
             size=(self.input_depth, self.input_height, self.input_width),
             mode="nearest",
         )
-        return torch.cat([ct_tensor, mask_tensor], dim=1).squeeze(0)
+        return torch.where(
+            mask_tensor > 0,
+            ct_tensor,
+            torch.full_like(ct_tensor, _OUTSIDE_MASK_VALUE),
+        ).squeeze(0)
 
     def _zero_organ_tensor(self) -> torch.Tensor:
-        return torch.zeros(
-            2,
-            self.input_depth,
-            self.input_height,
-            self.input_width,
+        return torch.full(
+            (1, self.input_depth, self.input_height, self.input_width),
+            _OUTSIDE_MASK_VALUE,
             dtype=torch.float32,
         )
 
@@ -436,7 +456,7 @@ class EsophagusRiskE3aMultiOrganRoi3DDataset(BaseDataset):
 
         ct_roi = ct_volume[d_start:d_end, h_start:h_end, w_start:w_end]
         mask_roi = organ_mask[d_start:d_end, h_start:h_end, w_start:w_end]
-        ct_roi = self._normalize_roi(roi=ct_roi)
+        ct_roi = self._normalize_roi(roi=ct_roi, mask_roi=mask_roi)
         return self._resize_ct_and_mask(ct_roi=ct_roi, mask_roi=mask_roi)
 
     def __getitem__(self, sample_size_and_index: Any) -> Dict[str, Any]:
