@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize G1-G3 Tongji internal validation and Youyi external validation.
+"""Summarize G1-G4 Tongji internal validation and Youyi external validation.
 
 Example (run from the ml-cvnets repository on the server):
 
@@ -22,6 +22,10 @@ Selection protocol (same as the 2026-09-17 F-series lock):
 
 Internal threshold metrics are optimistic because the same 60 validation cases
 select both the checkpoint and the cutoff.
+
+Checkpoints are not synced off the server. ``--skip-checkpoint-check`` runs the
+same analysis from the metric and prediction files alone and says so in the
+report; every other check still applies.
 """
 
 import argparse
@@ -84,6 +88,20 @@ G_SERIES_RUNS: tuple[tuple[str, str, str], ...] = (
         "g3_esophagus_spleen_portal_masked_tongji82_4cm_seed42",
     ),
 )
+# Kept apart from G_SERIES_RUNS so the G1-G3 DeLong family (45 pairs) is unchanged.
+G4_RUNS: tuple[tuple[str, str, str], ...] = (
+    (
+        "G4 E+L",
+        "G4_esophagus_liver",
+        "g4_esophagus_liver_clinical_masked_tongji82_4cm_seed42",
+    ),
+    (
+        "G4 E+L+S",
+        "G4_esophagus_liver_spleen",
+        "g4_esophagus_liver_spleen_clinical_masked_tongji82_4cm_seed42",
+    ),
+)
+SUMMARY_RUNS = G_SERIES_RUNS + G4_RUNS
 EXTERNAL_SUFFIX = "_youyi_external_auc_best"
 VALIDATION_STAGE = "validation"
 EXTERNAL_STAGE = "youyi_external"
@@ -232,17 +250,7 @@ def cohort_signature(cases: Sequence[Case]) -> tuple[tuple[str, int], ...]:
     return tuple((case.case_id, case.target) for case in cases)
 
 
-def summarize_run(results_root: Path, name: str, subdir: str, label: str) -> dict:
-    run_dir = results_root / subdir / label
-    external_dir = results_root / subdir / f"{label}{EXTERNAL_SUFFIX}"
-    for directory in (run_dir, external_dir):
-        if not directory.is_dir():
-            raise FileNotFoundError(f"{name}: directory not found: {directory}")
-
-    aucs = read_validation_auc_by_epoch(run_dir / "validation_confusion_matrix.jsonl")
-    best_epoch = select_auc_best_epoch(aucs)
-    tie_epochs = sorted(e for e, auc in aucs.items() if auc == aucs[best_epoch])
-
+def verify_auc_checkpoint(name: str, run_dir: Path, best_epoch: int) -> None:
     checkpoint_epoch, checkpoint_path = top_auc_checkpoint(run_dir)
     if checkpoint_epoch != best_epoch:
         raise ValueError(
@@ -254,6 +262,27 @@ def summarize_run(results_root: Path, name: str, subdir: str, label: str) -> dic
         best_copy, checkpoint_path, shallow=False
     ):
         raise ValueError(f"{name}: {best_copy} is not a copy of {checkpoint_path}")
+
+
+def summarize_run(
+    results_root: Path,
+    name: str,
+    subdir: str,
+    label: str,
+    check_checkpoints: bool = True,
+) -> dict:
+    run_dir = results_root / subdir / label
+    external_dir = results_root / subdir / f"{label}{EXTERNAL_SUFFIX}"
+    for directory in (run_dir, external_dir):
+        if not directory.is_dir():
+            raise FileNotFoundError(f"{name}: directory not found: {directory}")
+
+    aucs = read_validation_auc_by_epoch(run_dir / "validation_confusion_matrix.jsonl")
+    best_epoch = select_auc_best_epoch(aucs)
+    tie_epochs = sorted(e for e, auc in aucs.items() if auc == aucs[best_epoch])
+
+    if check_checkpoints:
+        verify_auc_checkpoint(name, run_dir, best_epoch)
 
     validation = read_predictions(
         run_dir / "validation_predictions.csv", VALIDATION_STAGE, best_epoch
@@ -300,6 +329,9 @@ def summarize_run(results_root: Path, name: str, subdir: str, label: str) -> dic
         )
         row.update({f"{prefix}_{k}": v for k, v in point.metrics().items()})
     row["_cohorts"] = (cohort_signature(validation), cohort_signature(external))
+    row["_status"] = json.loads(
+        (run_dir / "training_run_summary.json").read_text(encoding="utf-8")
+    )["status"]
     row["_run_dir"] = str(run_dir)
     row["_external_dir"] = str(external_dir)
     return row
@@ -329,7 +361,7 @@ def markdown_report(rows: Sequence[dict]) -> str:
     metric_header = "| ACC | Sens | Spec | PPV | NPV | F1 | TN/FP/FN/TP |"
     metric_rule = "|---:|---:|---:|---:|---:|---:|---|"
     lines = [
-        "# G1-G3 internal and external validation",
+        "# G1-G4 internal and external validation",
         "",
         "Checkpoint: highest Tongji validation AUC (ties keep the earliest epoch).",
         "Cutoff: Youden J on that epoch's validation predictions; positive when",
@@ -385,6 +417,12 @@ def check_shared_cohorts(rows: Sequence[dict]) -> list[str]:
                     f"{row['model']}: {label} cases or labels differ from "
                     f"{rows[0]['model']}"
                 )
+    for row in rows:
+        if row["_status"] != "completed":
+            warnings.append(
+                f"{row['model']}: training status is {row['_status']}; last logged "
+                f"epoch {row['epochs_logged']}"
+            )
     return warnings
 
 
@@ -393,6 +431,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--results-root", type=Path, required=True)
     parser.add_argument(
         "--output-dir", type=Path, required=True, help="Must not already exist"
+    )
+    parser.add_argument(
+        "--skip-checkpoint-check",
+        action="store_true",
+        help="Do not verify checkpoint files; use when only metrics were synced",
     )
     return parser.parse_args(argv)
 
@@ -404,8 +447,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if output_dir.exists():
         raise FileExistsError(f"use a fresh output directory: {output_dir}")
 
-    rows = [summarize_run(results_root, *run) for run in G_SERIES_RUNS]
+    rows = [
+        summarize_run(results_root, *run, check_checkpoints=not args.skip_checkpoint_check)
+        for run in SUMMARY_RUNS
+    ]
     warnings = check_shared_cohorts(rows)
+    if args.skip_checkpoint_check:
+        warnings.append(
+            "Checkpoint files were not verified (--skip-checkpoint-check)."
+        )
 
     output_dir.mkdir(parents=True)
     fields = [key for key in rows[0] if not key.startswith("_")]
